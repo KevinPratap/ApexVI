@@ -43,6 +43,10 @@ pub(crate) struct Staging {
     layout: victory_formats::texture::Layout,
     /// Mips per array slice.
     mips: u32,
+    /// The title's levels its host copy leaves off at the top
+    /// (`crate::resource::mip_drop`): the host's level `k` is the title's
+    /// level `k + first`.
+    first: u32,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
     memory: *const u8,
@@ -1221,7 +1225,7 @@ impl Staging {
             }
             if let Err(e) =
                 self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+                    .detile(tiled, mip + self.first, slice, linear, pitch, pitch * rows as usize)
             {
                 if detile_zero() {
                     // The level is zeros, not what the staging buffer held
@@ -1611,6 +1615,7 @@ fn make_staging(
         rows,
         layout,
         mips: u32::from(d.MipLevels),
+        first: crate::resource::levels_left_off(&desc, &d),
         bytes: total,
         memory,
         last: Mutex::default(),

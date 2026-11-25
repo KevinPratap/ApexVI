@@ -844,8 +844,32 @@ fn unlike(dst: This, src: This) -> bool {
             tracing::warn!(?dst, ?src, "copy between a stand-in target and title-format texels skipped")
         });
     }
-    unlike
+    unlike || left_off(dst) || left_off(src)
 }
+
+/// Whether `this` has a host copy without the title's top levels
+/// (`VICTORY_TEXTURE_MIP_DROP`): the title's copies and resolves name its
+/// subresources and sizes, which the host copy does not have, so they are
+/// left out (the host copy keeps what was uploaded from title memory).
+#[cfg(windows)]
+fn left_off(this: This) -> bool {
+    let left_off = crate::resource::host_resource(this).is_some_and(|host| crate::resource::dropped_levels(this, host) > 0);
+    if left_off {
+        let n = LEFT_OFF_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n == 0 || n.is_power_of_two() && n >= 1024 {
+            tracing::info!(
+                copies = n + 1,
+                ?this,
+                "copies or resolves of a texture without its top levels left out (VICTORY_TEXTURE_MIP_DROP)"
+            );
+        }
+    }
+    left_off
+}
+
+/// Copies and resolves left out by [`left_off`] since the start.
+#[cfg(windows)]
+static LEFT_OFF_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Copies left out because both sides were one host texture
 /// ([`copy_resource`], [`copy_texture_region`]), since the start.

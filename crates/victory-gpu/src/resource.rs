@@ -1349,7 +1349,25 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         }
         let texture = match texture {
             Some(texture) => Some(texture),
-            None => host_texture(&r.desc, r.host.state, clear),
+            // Without its top levels if asked for ([`mip_drop`]); as the
+            // title described it if the host will not make that.
+            None => match mip_drop(&r.desc) {
+                0 => host_texture(&r.desc, r.host.state, clear),
+                n => {
+                    let mut smaller = r.desc;
+                    smaller.width >>= n;
+                    smaller.height >>= n;
+                    smaller.mip_levels = (mip_count(&r.desc) - n) as u16;
+                    match host_texture(&smaller, r.host.state, clear) {
+                        Some(texture) => {
+                            MIP_DROPPED[0].fetch_add(1, Relaxed);
+                            MIP_DROPPED[1].fetch_add(footprint(&r.desc).map_or(0, |f| f.size), Relaxed);
+                            Some(texture)
+                        }
+                        None => host_texture(&r.desc, r.host.state, clear),
+                    }
+                }
+            },
         };
         let Some(texture) = texture else {
             r.host.refused.store(true, Relaxed);
@@ -2034,6 +2052,110 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
         return None;
     }
     hosted(this, true).map(|made| made.0)
+}
+
+/// Top levels left off title textures' host copies
+/// (`VICTORY_TEXTURE_MIP_DROP=N`, 1 to 3; 0, off, by default): on a card
+/// too small for the world's textures (6 GB: some 10,000 never got a host
+/// copy) each host copy takes about a quarter of the memory per level
+/// left off, and shows the title's level N where it asked for level 0.
+#[cfg(windows)]
+fn mip_drop_asked() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let n = std::env::var("VICTORY_TEXTURE_MIP_DROP")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(3);
+        if n > 0 {
+            tracing::info!(
+                levels = n,
+                floor = MIP_DROP_FLOOR,
+                "host copies of block-compressed 2D textures the title fills leave off their top levels (VICTORY_TEXTURE_MIP_DROP)"
+            );
+        }
+        n
+    })
+}
+
+/// The smallest a host copy's top level is made by [`mip_drop`], in
+/// texels each way.
+#[cfg(windows)]
+const MIP_DROP_FLOOR: u64 = 256;
+
+/// Host copies made without their top levels ([`mip_drop`]) since the
+/// start, and the bytes the title's whole descriptions would have taken.
+#[cfg(windows)]
+pub(crate) static MIP_DROPPED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// How many top levels the host copy of a title texture of `desc` leaves
+/// off ([`mip_drop_asked`]): only for what the title fills itself (no
+/// render target, depth or unordered access: the card never writes it),
+/// 2D, one layer, one sample, block-compressed (BC1 to BC7: sampled through
+/// views, not read texel by texel), with more levels than are left off
+/// and its new top level at least [`MIP_DROP_FLOOR`] texels and whole
+/// blocks each way. Fewer levels if that is all such a texture allows;
+/// 0 for any other texture.
+#[cfg(windows)]
+fn mip_drop(desc: &ResourceDesc) -> u32 {
+    let asked = mip_drop_asked();
+    if asked == 0 {
+        return 0;
+    }
+    const TEXTURE_2D: u32 = 3;
+    let format = pc_format(desc.format);
+    let block_compressed = (70..=84).contains(&format) || (94..=99).contains(&format);
+    if !fills(desc)
+        || desc.dimension != TEXTURE_2D
+        || desc.depth_or_array_size != 1
+        || desc.sample_count > 1
+        || !block_compressed
+    {
+        return 0;
+    }
+    let mips = mip_count(desc);
+    let (width, height) = (desc.width, u64::from(desc.height));
+    (1..=asked)
+        .rev()
+        .find(|&n| {
+            let (w, h) = (width >> n, height >> n);
+            mips > n && w >= MIP_DROP_FLOOR && h >= MIP_DROP_FLOOR && w % 4 == 0 && h % 4 == 0
+        })
+        .unwrap_or(0)
+}
+
+/// How many top levels of title texture `desc` its host copy `host`
+/// leaves off ([`mip_drop`]): `n` where the host copy is the title's
+/// description from level `n` on, else 0. Read from the two descriptions,
+/// so that it holds for every title texture sharing the host copy, and
+/// takes no lock.
+#[cfg(windows)]
+pub(crate) fn levels_left_off(
+    desc: &ResourceDesc,
+    host: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
+) -> u32 {
+    const TEXTURE_2D: u32 = 3;
+    if mip_drop_asked() == 0 || desc.dimension != TEXTURE_2D || host.Width >= desc.width {
+        return 0;
+    }
+    (1..=3)
+        .find(|&n| {
+            desc.width >> n == host.Width
+                && u64::from(desc.height) >> n == u64::from(host.Height)
+                && mip_count(desc) == u32::from(host.MipLevels) + n
+        })
+        .unwrap_or(0)
+}
+
+/// [`levels_left_off`] for title texture `this` and its host copy `host`.
+#[cfg(windows)]
+pub(crate) fn dropped_levels(this: This, host: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> u32 {
+    if this.is_null() || mip_drop_asked() == 0 {
+        return 0;
+    }
+    // SAFETY: a live resource.
+    levels_left_off(&resource(this).desc, &unsafe { host.GetDesc() })
 }
 
 /// A host texture like the title's: same description, in GPU memory,

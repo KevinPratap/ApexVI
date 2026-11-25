@@ -2813,6 +2813,18 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     };
                     crate::tiles::show_from(desc.get_or_insert(whole), first, u32::from(own.MipLevels));
                 }
+                // A host copy without the title's top levels
+                // (`VICTORY_TEXTURE_MIP_DROP`): the title's view names its
+                // levels. A view without a description shows the host
+                // copy whole, which is already right.
+                if let Some(desc) = desc.as_mut() {
+                    let left_off = crate::resource::dropped_levels(resource, texture);
+                    if left_off > 0 {
+                        // SAFETY: a live resource.
+                        let levels = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+                        crate::tiles::left_off(desc, left_off, levels);
+                    }
+                }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
                     device.CreateShaderResourceView(

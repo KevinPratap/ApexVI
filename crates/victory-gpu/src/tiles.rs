@@ -682,6 +682,50 @@ pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, 
     }
 }
 
+/// A two-dimensional shader view (2D or 2D array) of a title texture whose
+/// host copy leaves off its top `left_off` levels (`crate::resource`
+/// `mip_drop`), as a view of the host copy, which has `levels` levels: a
+/// view from the title's level `m` starts at the host's level `m - left_off`
+/// (at 0, showing as many levels fewer, if `m` was one of those left off),
+/// and its `ResourceMinLODClamp` (a level of the resource) moves down by
+/// `left_off`.
+pub(crate) fn left_off(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, left_off: u32, levels: u32) {
+    if left_off == 0 || levels == 0 {
+        return;
+    }
+    let shift = |most: &mut u32, mips: &mut u32, min_lod: &mut f32| {
+        if *most >= left_off {
+            *most -= left_off;
+        } else {
+            let fewer = left_off - *most;
+            *most = 0;
+            if *mips != u32::MAX {
+                *mips = mips.saturating_sub(fewer).max(1);
+            }
+        }
+        *most = (*most).min(levels - 1);
+        if *mips != u32::MAX {
+            *mips = (*mips).clamp(1, levels - *most);
+        }
+        if *min_lod > 0.0 {
+            *min_lod = (*min_lod - left_off as f32).max(0.0);
+        }
+    };
+    match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => {
+            // SAFETY: `ViewDimension` selects `Texture2D`.
+            let view = unsafe { &mut desc.Anonymous.Texture2D };
+            shift(&mut view.MostDetailedMip, &mut view.MipLevels, &mut view.ResourceMinLODClamp);
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+            // SAFETY: `ViewDimension` selects `Texture2DArray`.
+            let view = unsafe { &mut desc.Anonymous.Texture2DArray };
+            shift(&mut view.MostDetailedMip, &mut view.MipLevels, &mut view.ResourceMinLODClamp);
+        }
+        _ => {}
+    }
+}
+
 /// For the log, with the texture queue's line: what this saves, and what
 /// the mapping calls cost since the line before.
 pub(crate) fn status() {
@@ -1583,5 +1627,77 @@ void look() {
         assert!(!changed && waiting);
         assert!(!tiled.has_tiles(0));
         assert_eq!(tiled.given_bytes(), 0);
+    }
+}
+
+#[cfg(test)]
+mod left_off_tests {
+    use super::left_off;
+    use windows::Win32::Graphics::Direct3D12::*;
+
+    fn view_2d(most: u32, mips: u32, min_lod: f32) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+        D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: most, MipLevels: mips, PlaneSlice: 0, ResourceMinLODClamp: min_lod },
+            },
+            ..Default::default()
+        }
+    }
+
+    fn of(v: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> (u32, u32, f32) {
+        // SAFETY: the tests make 2D views only.
+        let t = unsafe { v.Anonymous.Texture2D };
+        (t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp)
+    }
+
+    /// A 2048x2048 texture of 12 levels with one left off: the host copy is
+    /// 1024x1024 of 11.
+    #[test]
+    fn a_view_of_the_title_s_levels_names_the_host_copy_s() {
+        // The whole chain from level 0: the host's level 0 on, all of it.
+        let mut v = view_2d(0, u32::MAX, 0.0);
+        left_off(&mut v, 1, 11);
+        assert_eq!(of(&v), (0, u32::MAX, 0.0));
+        // Twelve levels from 0: eleven from the host's 0.
+        let mut v = view_2d(0, 12, 0.0);
+        left_off(&mut v, 1, 11);
+        assert_eq!(of(&v), (0, 11, 0.0));
+        // From the title's level 3, four levels: the host's 2, four levels.
+        let mut v = view_2d(3, 4, 0.0);
+        left_off(&mut v, 1, 11);
+        assert_eq!(of(&v), (2, 4, 0.0));
+        // A clamp at resource level 2.5 is the host's 1.5.
+        let mut v = view_2d(0, u32::MAX, 2.5);
+        left_off(&mut v, 1, 11);
+        assert_eq!(of(&v), (0, u32::MAX, 1.5));
+        // Two left off, a view of the title's level 1 only (one of them):
+        // the host's level 0, one level.
+        let mut v = view_2d(1, 1, 0.0);
+        left_off(&mut v, 2, 10);
+        assert_eq!(of(&v), (0, 1, 0.0));
+        // A view past the host copy's last level stays inside it.
+        let mut v = view_2d(11, 1, 0.0);
+        left_off(&mut v, 1, 11);
+        assert_eq!(of(&v), (10, 1, 0.0));
+        // Nothing left off: unchanged.
+        let mut v = view_2d(3, 4, 1.0);
+        left_off(&mut v, 0, 12);
+        assert_eq!(of(&v), (3, 4, 1.0));
+    }
+
+    #[test]
+    fn a_2d_array_view_moves_the_same_way() {
+        let mut v = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_SRV { MostDetailedMip: 2, MipLevels: 3, FirstArraySlice: 0, ArraySize: 1, PlaneSlice: 0, ResourceMinLODClamp: 0.0 },
+            },
+            ..Default::default()
+        };
+        left_off(&mut v, 2, 9);
+        // SAFETY: a 2D array view.
+        let t = unsafe { v.Anonymous.Texture2DArray };
+        assert_eq!((t.MostDetailedMip, t.MipLevels), (0, 3));
     }
 }
