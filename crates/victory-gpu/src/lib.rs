@@ -17,6 +17,8 @@
 //! `present` (swap chain).
 
 #[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
+mod ambient;
 mod capture;
 #[cfg(windows)]
 mod card_mask;
