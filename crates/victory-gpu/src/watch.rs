@@ -441,6 +441,7 @@ pub(crate) fn once() -> bool {
 /// refresh) as [`ask_ahead`] does, and lets that asking stand until
 /// [`ask_once_end`].
 pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
+    ABSENT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if !once() {
         return;
     }
@@ -1292,6 +1293,51 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
 
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.
 fn uncommitted_end(block: usize) -> usize {
+    if absent_cache() {
+        let at = ABSENT_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+        let mut cache = ABSENT.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.0 != at {
+            *cache = (at, BTreeMap::new());
+        }
+        if let Some((_, &end)) = cache.1.range(..=block).next_back()
+            && end > block
+        {
+            return end;
+        }
+        drop(cache);
+        let end = uncommitted_end_asked(block);
+        if end > block {
+            let mut cache = ABSENT.lock().unwrap_or_else(|e| e.into_inner());
+            if cache.0 == at {
+                cache.1.insert(block, end);
+            }
+        }
+        return end;
+    }
+    uncommitted_end_asked(block)
+}
+
+/// Whether [`uncommitted_end`]'s answers stand for the rest of a
+/// submission's preparation (`VICTORY_GUARD_ABSENT_CACHE=1`; off by
+/// default). [`guard`] asks Windows about the blocks it noted absent at every
+/// call, since an ordinary commit comes with no word to us: run batch18's
+/// profile had about 9 ms a frame of the submitting thread in VirtualQuery
+/// from there, the same regions asked again for each copy over a view. With
+/// the switch the uncommitted regions it was told of are kept until the
+/// next submission's asking (`ask_once`) or a mapping the runtime announces
+/// ([`title_memory_remapped`]): a commit in between is seen by the next
+/// submission instead.
+fn absent_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_ABSENT_CACHE").is_some_and(|v| v == "1"))
+}
+
+/// [`absent_cache`]: the time the regions below stand for, and those
+/// regions (first block, end block) found uncommitted in it.
+static ABSENT_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ABSENT: Mutex<(u64, BTreeMap<usize, usize>)> = Mutex::new((0, BTreeMap::new()));
+
+fn uncommitted_end_asked(block: usize) -> usize {
     use windows_sys::Win32::System::Memory::{
         MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
@@ -1532,6 +1578,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    ABSENT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     REMAPS[4].fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
