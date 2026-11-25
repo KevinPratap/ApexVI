@@ -754,7 +754,12 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     // View memory the guards already hold cannot be write-watched: the
     // kernel asking would only fail. Copies of it are flushed many times a
     // frame, each time paying that failed call before the guards answer.
-    let known_view = guarded && known_view(first * PAGE);
+    // Unguarded too with `VICTORY_WATCH_VIEWS_SKIP=1`: a texture's refresh
+    // asks unguarded first, and for one in view memory that asking can only
+    // fail (run batch9: 200 failed askings a frame, all texture refreshes)
+    // before its guarded one; an unguarded asking that fails says `None`,
+    // which is what it says here without the kernel call.
+    let known_view = (guarded || views_skip()) && known_view(first * PAGE);
     let answer = if known_view { None } else { kernel_pages(j, first, last, asker()) };
     let failed = answer.is_none();
     #[cfg(feature = "diagnostics")]
@@ -897,6 +902,13 @@ fn known_view(start: usize) -> bool {
         VIEW_MEMO.with(|m| m.borrow_mut().keep(first));
     }
     view || g.absent.contains(&first)
+}
+
+/// Whether [`writes`] skips the kernel for view memory the guards hold also
+/// when it is asked unguarded (`VICTORY_WATCH_VIEWS_SKIP=1`; off by default).
+fn views_skip() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_VIEWS_SKIP").is_some_and(|v| v == "1"))
 }
 
 /// Whether [`known_view`] remembers, on each thread, the blocks it found to
