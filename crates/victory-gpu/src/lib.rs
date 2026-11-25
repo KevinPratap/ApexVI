@@ -16,9 +16,9 @@
 //! libraries recording into title lists. Planned:
 //! `present` (swap chain).
 
-#[cfg(all(windows, feature = "diagnostics"))]
 #[cfg(windows)]
 mod ambient;
+#[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
 mod card_mask;
