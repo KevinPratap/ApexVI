@@ -2071,7 +2071,7 @@ fn mip_drop_asked() -> u32 {
         if n > 0 {
             tracing::info!(
                 levels = n,
-                floor = MIP_DROP_FLOOR,
+                floor = mip_drop_floor(),
                 "host copies of block-compressed 2D textures the title fills leave off their top levels (VICTORY_TEXTURE_MIP_DROP)"
             );
         }
@@ -2080,9 +2080,123 @@ fn mip_drop_asked() -> u32 {
 }
 
 /// The smallest a host copy's top level is made by [`mip_drop`], in
-/// texels each way.
+/// texels each way: `VICTORY_TEXTURE_MIP_DROP_FLOOR` (16 to 4096; 256 by
+/// default).
 #[cfg(windows)]
-const MIP_DROP_FLOOR: u64 = 256;
+fn mip_drop_floor() -> u64 {
+    static FLOOR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MIP_DROP_FLOOR")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(256)
+            .clamp(16, 4096)
+    })
+}
+
+/// Why [`mip_drop`] left a texture whole, or that it did not
+/// ([`MIP_DROP_WHY`]): 0 levels left off, 1 the card writes it, 2 not 2D
+/// with one layer and one sample, 3 not block-compressed, 4 too few
+/// levels, 5 its top level would be under the floor (or not whole blocks).
+#[cfg(all(windows, feature = "diagnostics"))]
+const MIP_DROP_REASONS: [&str; 6] = ["left off", "card writes it", "not 2D/1 layer/1 sample", "not BCn", "too few levels", "under the floor"];
+
+/// Host copies made since the start by [`mip_drop`]'s verdict
+/// ([`MIP_DROP_REASONS`]): how many, and the bytes of the title's whole
+/// descriptions.
+#[cfg(windows)]
+static MIP_DROP_WHY: [[std::sync::atomic::AtomicU64; 2]; 6] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 6];
+
+/// [`mip_drop`]'s rules for `desc`, with `asked` levels and `floor`: the
+/// reason ([`MIP_DROP_REASONS`]) and the levels left off (0 unless the
+/// reason is 0).
+#[cfg(windows)]
+fn mip_drop_rule(desc: &ResourceDesc, asked: u32, floor: u64) -> (usize, u32) {
+    const TEXTURE_2D: u32 = 3;
+    if !fills(desc) {
+        return (1, 0);
+    }
+    if desc.dimension != TEXTURE_2D || desc.depth_or_array_size != 1 || desc.sample_count > 1 {
+        return (2, 0);
+    }
+    let format = pc_format(desc.format);
+    if !((70..=84).contains(&format) || (94..=99).contains(&format)) {
+        return (3, 0);
+    }
+    let mips = mip_count(desc);
+    if mips <= 1 {
+        return (4, 0);
+    }
+    let (width, height) = (desc.width, u64::from(desc.height));
+    let n = (1..=asked)
+        .rev()
+        .find(|&n| {
+            let (w, h) = (width >> n, height >> n);
+            mips > n && w >= floor && h >= floor && w % 4 == 0 && h % 4 == 0
+        })
+        .unwrap_or(0);
+    if n > 0 { (0, n) } else { (5, 0) }
+}
+
+/// For the memory line (`VICTORY_TEXTURE_MIP_DROP` on): host copies made
+/// so far by [`mip_drop`]'s verdict, and the title textures that have no
+/// host copy now by the verdict they would get, with how many more a floor
+/// of 128 and of 64 would take: whether the textures still waiting for
+/// room are ones it leaves whole, and why.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn mip_drop_line() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let asked = mip_drop_asked();
+    if asked == 0 {
+        return;
+    }
+    let floor = mip_drop_floor();
+    // [reason] -> (count, bytes); then (count, bytes) qualifying at 128 and at 64
+    let mut without = [[0u64; 2]; 6];
+    let mut lower = [[0u64; 2]; 2];
+    for &at in textures().iter() {
+        // SAFETY: as in `census`.
+        let r = unsafe { &*(at as *const Resource) };
+        if r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+            continue;
+        }
+        let bytes = footprint(&r.desc).map_or(0, |f| f.size);
+        let (why, _) = mip_drop_rule(&r.desc, asked, floor);
+        without[why][0] += 1;
+        without[why][1] += bytes;
+        if why == 5 {
+            for (k, f) in [128u64, 64].into_iter().enumerate() {
+                if f < floor && mip_drop_rule(&r.desc, asked, f).0 == 0 {
+                    lower[k][0] += 1;
+                    lower[k][1] += bytes;
+                }
+            }
+        }
+    }
+    let mb = |b: u64| b >> 20;
+    let made: Vec<String> = MIP_DROP_REASONS
+        .iter()
+        .zip(&MIP_DROP_WHY)
+        .map(|(name, c)| format!("{name} {} ({} MB)", c[0].load(Relaxed), mb(c[1].load(Relaxed))))
+        .collect();
+    let waiting: Vec<String> = MIP_DROP_REASONS
+        .iter()
+        .zip(&without)
+        .map(|(name, c)| format!("{name} {} ({} MB)", c[0], mb(c[1])))
+        .collect();
+    tracing::info!(
+        "mip drop (VICTORY_TEXTURE_MIP_DROP={asked}, floor {floor}): host copies made so far: {}; title textures \
+         without a host copy now, as they would be made: {}; of those under the floor, a floor of 128 would take \
+         {} ({} MB) and of 64 {} ({} MB)",
+        made.join(", "),
+        waiting.join(", "),
+        lower[0][0],
+        mb(lower[0][1]),
+        lower[1][0],
+        mb(lower[1][1]),
+    );
+}
 
 /// Host copies made without their top levels ([`mip_drop`]) since the
 /// start, and the bytes the title's whole descriptions would have taken.
@@ -2094,7 +2208,7 @@ pub(crate) static MIP_DROPPED: [std::sync::atomic::AtomicU64; 2] = [const { std:
 /// render target, depth or unordered access: the card never writes it),
 /// 2D, one layer, one sample, block-compressed (BC1 to BC7: sampled through
 /// views, not read texel by texel), with more levels than are left off
-/// and its new top level at least [`MIP_DROP_FLOOR`] texels and whole
+/// and its new top level at least [`mip_drop_floor`] texels and whole
 /// blocks each way. Fewer levels if that is all such a texture allows;
 /// 0 for any other texture.
 #[cfg(windows)]
@@ -2103,26 +2217,10 @@ fn mip_drop(desc: &ResourceDesc) -> u32 {
     if asked == 0 {
         return 0;
     }
-    const TEXTURE_2D: u32 = 3;
-    let format = pc_format(desc.format);
-    let block_compressed = (70..=84).contains(&format) || (94..=99).contains(&format);
-    if !fills(desc)
-        || desc.dimension != TEXTURE_2D
-        || desc.depth_or_array_size != 1
-        || desc.sample_count > 1
-        || !block_compressed
-    {
-        return 0;
-    }
-    let mips = mip_count(desc);
-    let (width, height) = (desc.width, u64::from(desc.height));
-    (1..=asked)
-        .rev()
-        .find(|&n| {
-            let (w, h) = (width >> n, height >> n);
-            mips > n && w >= MIP_DROP_FLOOR && h >= MIP_DROP_FLOOR && w % 4 == 0 && h % 4 == 0
-        })
-        .unwrap_or(0)
+    let (why, n) = mip_drop_rule(desc, asked, mip_drop_floor());
+    MIP_DROP_WHY[why][0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    MIP_DROP_WHY[why][1].fetch_add(footprint(desc).map_or(0, |f| f.size), std::sync::atomic::Ordering::Relaxed);
+    n
 }
 
 /// How many top levels of title texture `desc` its host copy `host`

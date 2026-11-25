@@ -714,6 +714,7 @@ fn log_memory() {
             WALKING.store(false, Relaxed);
         }
     }
+    crate::resource::mip_drop_line();
     let kept = crate::pipeline::kept();
     tracing::info!(
         "memory kept beside the lines below: {} shader containers {:.0} MB, {} translations \
