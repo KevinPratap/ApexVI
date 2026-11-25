@@ -2606,6 +2606,18 @@ fn flying() -> bool {
     line.settling || line.line.iter().any(|l| matches!(l, Late::Run(_)))
 }
 
+/// Whether a submission's one write-watch asking (`VICTORY_ASK_ONCE`) also
+/// covers the memory of the staged textures its lists sample
+/// (`VICTORY_WATCH_TEXTURES_JOINED=1`; off by default). Each texture's
+/// refresh asked the kernel on its own (one or two calls): run batch7 had
+/// 223 GetWriteWatch calls a frame from texture refreshes, for 38,000 pages
+/// (small textures), of 392. Joined, neighbouring textures are one asking
+/// (`watch::ask_ahead`'s gap rule) and each refresh reads the journal.
+fn textures_joined() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_TEXTURES_JOINED").is_some_and(|v| v == "1"))
+}
+
 /// With flights in the air ([`late`]): why `runs` cannot be prepared
 /// before they are settled, if so. Preparing reads title memory on the
 /// CPU (the title's buffer copies, fills of upload memory, textures) and
@@ -5599,7 +5611,22 @@ impl Host {
                     }
                 }
             }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            let mut ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            // The staged textures its lists sample, asked with the rest
+            // (`textures_joined`): their refreshes then find the answer in
+            // the journal instead of asking the kernel one by one.
+            if textures_joined() {
+                for list in runs {
+                    for step in &list.deferred().copies {
+                        if let Step::Texture(staging) = step {
+                            let (at, len) = staging.memory();
+                            if len > 0 {
+                                ranges.push((at, at + len));
+                            }
+                        }
+                    }
+                }
+            }
             crate::watch::ask_once(&ranges);
             // Behind flights: the title wrote memory that a flight's shaders
             // may write too, and this submission refreshes it. The flights
