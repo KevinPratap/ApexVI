@@ -2503,6 +2503,9 @@ enum Late {
     Write(usize, crate::queue::Written, usize),
     /// A fence (its address) signalled behind the flights before it.
     Signal(usize, u64),
+    /// A title buffer copy (destination, source, bytes) made once the
+    /// flights before it have landed ([`copy_after_landing`]).
+    Copy(usize, usize, usize),
 }
 
 struct Line {
@@ -2580,6 +2583,102 @@ fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
     }
     let at = ranges.partition_point(|r| r.1 <= from);
     ranges.get(at).is_some_and(|r| r.0 < to)
+}
+
+/// Whether a title buffer copy that reads what flights in the air may write
+/// is made once they have landed instead of settling them
+/// (`VICTORY_COPY_AFTER_LANDING=1`; off by default). Run batch14: three 2 KB
+/// copies a frame out of a buffer the title's shaders write every frame
+/// (0x98cf7e000 to 0x91ed23000, ...) settled the flights twice a frame, 39 to
+/// 46 ms of the submitting thread. On the console such a copy runs on the
+/// card after the work before it; the title reads its destination after a
+/// fence, and the fences behind flights are set when they land, after the
+/// copy here.
+fn copy_after_landing() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_AFTER_LANDING").is_some_and(|v| v == "1"))
+}
+
+/// Copies made after landing, and ones that could not be (another step of
+/// their submission touches the destination), since the frame line.
+static COPIES_AFTER: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// With [`copy_after_landing`] and flights in the air: each title buffer
+/// copy of `runs` that only reads what the flights may write goes into the
+/// line behind them (made by the landing, [`Late::Copy`]) and is no step of
+/// the submission any more. Not when the flights may write its destination,
+/// or another step of the submission touches the destination (a copy, a
+/// fill, a refresh, a texture): that submission needs the bytes when it is
+/// prepared, and settles as before.
+fn copies_after_landing(runs: &[&HostList]) {
+    let written = {
+        let line = line();
+        if line.written.is_empty() {
+            return;
+        }
+        line.written.clone()
+    };
+    // Every range the submission's steps touch, with the step's place.
+    let mut touched: Vec<(usize, usize, usize, usize)> = Vec::new();
+    for (l, list) in runs.iter().enumerate() {
+        for (i, step) in list.deferred().copies.iter().enumerate() {
+            let mut add = |a: usize, b: usize| touched.push((l, i, a, b));
+            match step {
+                &Step::Copy(dst, src, len) => {
+                    add(dst, dst + len);
+                    add(src, src + len);
+                }
+                &Step::Fill(_, src, len) => add(src, src + len),
+                Step::Refresh(_, address, len) => add(*address, *address + *len),
+                Step::Texture(staging) => {
+                    let (at, len) = staging.memory();
+                    add(at, at + len);
+                }
+                Step::Run(_) | Step::Host(_) | Step::GpuWrite(..) => {}
+            }
+        }
+    }
+    let mut moved = Vec::new();
+    for (l, list) in runs.iter().enumerate() {
+        let mut deferred = list.deferred();
+        for (i, step) in deferred.copies.iter_mut().enumerate() {
+            let &mut Step::Copy(dst, src, len) = step else {
+                continue;
+            };
+            if !touches(&written, src, src + len) || touches(&written, dst, dst + len) {
+                continue;
+            }
+            let other = touched
+                .iter()
+                .any(|&(tl, ti, a, b)| (tl, ti) != (l, i) && a < dst + len && b > dst);
+            if other {
+                COPIES_AFTER[1].fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            moved.push((dst, src, len));
+            *step = Step::Host(Box::new(|| {}));
+        }
+    }
+    if moved.is_empty() {
+        return;
+    }
+    COPIES_AFTER[0].fetch_add(moved.len() as u64, Ordering::Relaxed);
+    let mut line = line();
+    // What follows reads a destination only once the copy is made: it is
+    // memory the line writes, as the flights' (a later submission that reads
+    // it waits for the landing).
+    join_ranges(&mut line.written, moved.iter().map(|&(dst, _, len)| (dst, dst + len)));
+    line.line.extend(moved.into_iter().map(|(dst, src, len)| Late::Copy(dst, src, len)));
+    drop(line);
+    LINE_MOVED.notify_one();
+    RELAY_MOVED.notify_one();
+}
+
+/// [`Late::Copy`], by the landing: what the flights before it wrote is in
+/// title memory now.
+fn copy_after(dst: usize, src: usize, len: usize) {
+    copy_mapped(dst as *mut u8, src as *const u8, len, true);
+    crate::watch::wrote(dst, len);
 }
 
 /// `ranges` with `more`, in order, joined where they overlap or touch.
@@ -3600,6 +3699,13 @@ fn late_line(frames: f64) {
     fill_check::line();
     fill_ahead::line(frames);
     crate::shadow::settle_why_line(frames);
+    if copy_after_landing() {
+        let [after, kept] = [0, 1].map(|i| COPIES_AFTER[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        tracing::info!(
+            "title buffer copies made after the flights they read landed, per frame (VICTORY_COPY_AFTER_LANDING=1): \
+             {after:.1}; left to settle as before (another step of their submission touches the destination): {kept:.1}"
+        );
+    }
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
@@ -5127,6 +5233,7 @@ impl Host {
                 }
                 Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
                 Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
+                Late::Copy(dst, src, len) => copy_after(dst, src, len),
             }
         }
         if last > 0 {
@@ -5155,9 +5262,15 @@ impl Host {
             *lists = 0;
             let mut ranges = Vec::new();
             for item in items.iter() {
-                if let Late::Run(flight) = item {
-                    *lists += flight.order.len().max(1);
-                    ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
+                match item {
+                    Late::Run(flight) => {
+                        *lists += flight.order.len().max(1);
+                        ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
+                    }
+                    // A copy still to be made writes its destination after
+                    // the landing (`copies_after_landing`).
+                    &Late::Copy(dst, _, len) => ranges.push((dst, dst + len)),
+                    _ => {}
                 }
             }
             join_ranges(written, ranges);
@@ -5553,6 +5666,7 @@ impl Host {
                     }
                     Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
                     Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
+                    Late::Copy(dst, src, len) => copy_after(dst, src, len),
                 }
             }
             if last > 0 {
@@ -5595,7 +5709,12 @@ impl Host {
         // what they write.
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
-        } else if let Some(why) = late_blocked(runs) {
+        } else if let Some(why) = {
+            if copy_after_landing() {
+                copies_after_landing(runs);
+            }
+            late_blocked(runs)
+        } {
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
