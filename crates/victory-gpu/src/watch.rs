@@ -73,6 +73,7 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     })
 }
 
+#[derive(Default)]
 struct Journal {
     /// Numbers the askings; 0 is "never".
     asked: u64,
@@ -80,10 +81,13 @@ struct Journal {
     written: BTreeMap<usize, u64>,
     /// Room for the kernel's answer.
     found: Vec<usize>,
+    stats: AskStats,
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
     /// and the asking that did: `writes` answers for a range inside one
     /// from the journal, without another kernel call.
     ahead: Vec<(usize, usize)>,
+    /// Reservation answers have both starts and ends in increasing order.
+    ordered: bool,
     ahead_asked: u64,
     /// The ahead asking stands for a whole submission ([`ask_once`]): no
     /// other ahead asking is made, and `ahead` stays, until
@@ -202,13 +206,63 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
     found: Vec::new(),
+    stats: AskStats { calls: [0; 4], pages: [0; 4] },
     ahead: Vec::new(),
+    ordered: false,
     ahead_asked: 0,
     kept: false,
     pieces: BTreeMap::new(),
     refused: BTreeSet::new(),
     refused_age: 0,
 });
+
+/// Count actual kernel crossings, including failures. The older timing also
+/// includes answers from view guards, which never enter GetWriteWatch.
+#[derive(Clone, Copy)]
+enum Caller {
+    Once,
+    Ahead,
+    Run,
+    Other,
+}
+
+#[derive(Default)]
+struct AskStats {
+    calls: [u64; 4],
+    pages: [u64; 4],
+}
+
+fn count_asks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_STATS").is_some_and(|v| v == "1"))
+}
+
+/// Opt-in (`VICTORY_WATCH_RESERVATION=1`; off by default): without it a
+/// submission uses the distance-based runs, recursive splits and remaining
+/// single ranges.
+fn by_reservation() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_RESERVATION").is_some_and(|v| v == "1"))
+}
+
+/// Taken on the one-second frame clock, under the same lock as the calls
+/// so the page and call counts cover exactly the same requests.
+pub(crate) fn asks_per_frame(frames: f64) -> String {
+    if !count_asks() {
+        return String::new();
+    }
+    let stats = std::mem::take(&mut JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).stats);
+    let pages = stats.pages.iter().sum::<u64>() as f64 / frames;
+    let calls = stats.calls.iter().sum::<u64>() as f64 / frames;
+    let [once, ahead, run, other] = stats.calls.map(|n| n as f64 / frames);
+    let [once_pages, ahead_pages, run_pages, other_pages] = stats.pages.map(|n| n as f64 / frames);
+    format!(
+        ", GetWriteWatch/frame {calls:.1} calls covering {pages:.1} 4 KiB pages ({:.0} bytes), \
+         calls/pages by caller (ask_once {once:.1}/{once_pages:.1}, ask_ahead {ahead:.1}/{ahead_pages:.1}, \
+         ask_run splits {run:.1}/{run_pages:.1}, other {other:.1}/{other_pages:.1})",
+        pages * KERNEL_PAGE as f64
+    )
+}
 
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
@@ -225,36 +279,44 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
-    let mut pieces: Vec<(usize, usize)> = ranges
+    let pieces = sorted_pages(ranges);
+    if pieces.len() < 2 {
+        return;
+    }
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    if !j.kept {
+        ask_nearby(&mut j, &pieces);
+    }
+}
+
+fn sorted_pages(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut pieces: Vec<_> = ranges
         .iter()
         .filter(|r| r.0 < r.1)
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
-    if pieces.len() < 2 {
-        return;
-    }
     pieces.sort_unstable();
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    let j = &mut *j;
-    // The submission's one asking stands ([`ask_once`]): what it does not
-    // hold is left to `writes`.
-    if j.kept {
-        return;
-    }
+    pieces
+}
+
+fn ask_nearby(j: &mut Journal, pieces: &[(usize, usize)]) {
     // View memory the guards hold is left to `writes`, which answers it
     // from the guards ([`known_view`]): the kernel's write watch can only
     // fail there. Asked here with the others, a run holding such a range
     // failed, was asked again by halves down to single ranges, failing
     // each time, and the range then went to `writes` all the same (after
     // triippywhale d0581a55). `VICTORY_VIEW_ASK=1` asks as before.
+    let mut pieces = pieces.to_vec();
     #[cfg(feature = "diagnostics")]
     let all = pieces.len();
     pieces.retain(|&(first, _)| !known_view(first * PAGE));
     #[cfg(feature = "diagnostics")]
     AHEAD_VIEWS.fetch_add((all - pieces.len()) as u64, std::sync::atomic::Ordering::Relaxed);
+    let pieces = &pieces[..];
     j.asked += 1;
     j.ahead_asked = j.asked;
     j.ahead.clear();
+    j.ordered = false;
     let mut i = 0;
     while i < pieces.len() {
         let first = pieces[i].0;
@@ -267,7 +329,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
             last = last.max(pieces[k].1);
             k += 1;
         }
-        ask_run(j, &pieces[i..k]);
+        ask_run(j, &pieces[i..k], Caller::Ahead);
         i = k;
     }
 }
@@ -312,7 +374,7 @@ pub(crate) fn ask_ahead_done() {
 }
 
 /// Whether a submission asks the kernel once, before its first refresh,
-/// about every range its lists refresh (`VICTORY_ASK_ONCE=1`; off by
+/// about every range its lists refresh (`VICTORY_ASK_ONCE=1`; on by
 /// default).
 ///
 /// A submission's refreshes are done in groups, between the title's own
@@ -342,12 +404,24 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     if !once() {
         return;
     }
+    // A re-ask after a flight settled retires the old answer immediately.
+    // Other refresh threads can ask for its writes while we sort the pieces.
     ask_once_end();
     let lean = ask_lean().then(|| lean_ranges(ranges));
     let ranges = lean.as_deref().unwrap_or(ranges);
+    if by_reservation() {
+        let pieces = sorted_pages(ranges);
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        ask_reservations(&mut j, &pieces);
+        return;
+    }
     ask_ahead(ranges);
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    let j = &mut *j;
+    ask_remaining(&mut j, ranges);
+}
+
+fn ask_remaining(j: &mut Journal, ranges: &[(usize, usize)]) {
+    j.ordered = false;
     if j.ahead.is_empty() {
         // `ask_ahead` asked nothing (fewer than two ranges).
         j.asked += 1;
@@ -373,7 +447,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
         if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
-            if ask_kernel(j, first, last) {
+            if ask_kernel(j, first, last, Caller::Once) {
                 j.ahead.push((first, last));
             } else if ask_lean() {
                 j.refused.insert(first);
@@ -381,6 +455,98 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         }
     }
     j.kept = !j.ahead.is_empty();
+}
+
+/// The profile put 51 of 245 busy samples in GetWriteWatch. Seven were
+/// below a recursive split after a combined asking failed. Query the
+/// allocation boundary once for its sorted pieces, including reserved
+/// holes. A mapped view is left to the existing guard path.
+fn reservation(first: usize) -> Option<(usize, bool)> {
+    use windows_sys::Win32::System::Memory::{
+        MemoryRegionInfo, QueryVirtualMemoryInformation, WIN32_MEMORY_REGION_INFORMATION,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut info = WIN32_MEMORY_REGION_INFORMATION::default();
+    // SAFETY: the query takes an address as input and fills our structure.
+    let ok = unsafe {
+        QueryVirtualMemoryInformation(
+            GetCurrentProcess(), (first * PAGE) as *const _, MemoryRegionInfo,
+            (&raw mut info).cast(), size_of_val(&info), std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let end = (info.AllocationBase as usize).checked_add(info.RegionSize)? / PAGE;
+    // SAFETY: the successful query filled the flags; bit zero is Private.
+    Some((end, unsafe { info.Anonymous.Flags } & 1 != 0))
+}
+
+/// Beyond the old eight MiB gap, join only substantial neighbours. Two
+/// tiny copies far apart shouldn't walk a GiB of page tables.
+fn can_join(first: usize, last: usize, (start, end): (usize, usize)) -> bool {
+    last.max(end) - first <= AHEAD_MAX
+        && start.saturating_sub(last) <= AHEAD_GAP.max((last - first).min(end - start))
+}
+
+/// Only a successful read-and-reset supplies an answer. Remember every
+/// returned page, even in a gap, but reuse the answer only on requested
+/// pieces. An unrelated refresh in the gap still asks for later writes.
+/// Every submission starts a fresh asking, including after a flight settles.
+fn ask_reservations(j: &mut Journal, mut pieces: &[(usize, usize)]) {
+    j.asked += 1;
+    j.ahead_asked = j.asked;
+    j.ahead.clear();
+    j.ordered = true;
+    // Even an all-view submission has finished its ahead pass. The guards
+    // still check every refresh; its flushes need no speculative kernel calls.
+    j.kept = !pieces.is_empty();
+    let mut allocation = None;
+    while let Some(&(first, end)) = pieces.first() {
+        if allocation.is_none_or(|(limit, _)| first >= limit) {
+            // An isolated piece already takes just one call. Spend a
+            // query on its boundary only to join neighbours or avoid a
+            // failed asking on a view. No boundary outlives this pass.
+            let neighbour = pieces.get(1).is_some_and(|&next| can_join(first, end, next));
+            allocation = if neighbour || known_view(first * PAGE) { reservation(first) } else { None };
+        }
+        let (limit, private) = allocation.unwrap_or((end, true));
+        let mut last = end;
+        let mut n = 1;
+        while let Some(&next) = pieces.get(n) {
+            if last > limit || next.1 > limit || !can_join(first, last, next) {
+                break;
+            }
+            last = last.max(next.1);
+            n += 1;
+        }
+        if (private || force_view_ask()) && ask_kernel(j, first, last, Caller::Once) {
+            keep_requested(&mut j.ahead, &pieces[..n]);
+        }
+        // Failed or raced with a remap: nothing was cached for this group.
+        // Its individual refreshes still go through read_writes.
+        pieces = &pieces[n..];
+    }
+}
+
+/// Starts arrive in order. Keep ends in order too, so thousands of copies
+/// can look up their answers without walking every earlier piece. Touching
+/// requests can share an entry only when this call covered them both.
+fn keep_requested(ahead: &mut Vec<(usize, usize)>, pieces: &[(usize, usize)]) {
+    let mut same_call = false;
+    for &(start, end) in pieces {
+        if let Some((_, last)) = ahead.last_mut() {
+            if end <= *last {
+                continue;
+            }
+            if same_call && start <= *last {
+                *last = end;
+                continue;
+            }
+        }
+        ahead.push((start, end));
+        same_call = true;
+    }
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
@@ -398,7 +564,7 @@ pub(crate) fn ask_once_end() {
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    if !j.kept || len == 0 {
+    if !j.kept || j.ahead.is_empty() || len == 0 {
         return;
     }
     j.asked += 1;
@@ -446,46 +612,30 @@ pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
 /// fails, as a run across two reservations or into memory that is not
 /// write-watched does. A piece alone is left to [`writes`].
-fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
+fn ask_run(j: &mut Journal, pieces: &[(usize, usize)], caller: Caller) {
     if pieces.len() < 2 {
         return;
     }
     let first = pieces[0].0;
     let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
-    if ask_kernel(j, first, last) {
+    if ask_kernel(j, first, last, caller) {
         j.ahead.push((first, last));
         return;
     }
     let (a, b) = pieces.split_at(pieces.len() / 2);
-    ask_run(j, a);
-    ask_run(j, b);
+    ask_run(j, a, Caller::Run);
+    ask_run(j, b, Caller::Run);
 }
 
 /// Asks the kernel for the written pages of pages `[first, last)` and notes
 /// them in the journal under the ahead asking; false (and nothing changed)
 /// if the range is not write-watched memory of one reservation.
-fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
-    use windows_sys::Win32::System::Memory::GetWriteWatch;
-    const WRITE_WATCH_FLAG_RESET: u32 = 1;
-    let mut count = (last - first) * PAGE / KERNEL_PAGE;
-    j.found.resize(count.max(j.found.len()), 0);
-    let mut granularity = 0;
+fn ask_kernel(j: &mut Journal, first: usize, last: usize, caller: Caller) -> bool {
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
-    if failed {
+    let Some(count) = kernel_pages(j, first, last, caller) else {
         return false;
-    }
+    };
     #[cfg(feature = "diagnostics")]
     {
         use crate::copystat::{C, add};
@@ -498,6 +648,33 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     true
 }
 
+/// A single read and reset. Even if every 4 KiB page was written the
+/// answer fits, and a concurrent store cannot fall between a read and a
+/// separate reset.
+fn kernel_pages(j: &mut Journal, first: usize, last: usize, caller: Caller) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    let mut count = (last - first) * PAGE / KERNEL_PAGE;
+    j.found.resize(count.max(j.found.len()), 0);
+    let mut granularity = 0;
+    if count_asks() {
+        j.stats.calls[caller as usize] += 1;
+        j.stats.pages[caller as usize] += count as u64;
+    }
+    // SAFETY: the answer buffer holds `count` entries.
+    let failed = unsafe {
+        GetWriteWatch(
+            WRITE_WATCH_FLAG_RESET,
+            (first * PAGE) as *const _,
+            (last - first) * PAGE,
+            j.found.as_mut_ptr().cast(),
+            &mut count,
+            &mut granularity,
+        )
+    } != 0;
+    (!failed).then_some(count)
+}
+
 /// What [`writes`] would say of `[start, end)` from the journal alone, if
 /// the range lies in one asked ahead ([`ask_ahead`], [`ask_once`]): the
 /// pages written since tracking began and the asking that last found each
@@ -506,10 +683,17 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
-        .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+    cached(&j, first, last)
+}
+
+fn cached(j: &Journal, first: usize, last: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+    let covered = if j.ordered {
+        let i = j.ahead.partition_point(|&(_, end)| end < last);
+        j.ahead.get(i).is_some_and(|&(start, _)| start <= first)
+    } else {
+        j.ahead.iter().any(|&(a, b)| a <= first && last <= b)
+    };
+    covered.then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -518,42 +702,21 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
-    use windows_sys::Win32::System::Memory::GetWriteWatch;
-    const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
-    if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
-        return Some((
-            j.ahead_asked,
-            j.written
-                .range(first..last)
-                .map(|(&p, &w)| (p, w))
-                .collect(),
-        ));
+    if let Some(answer) = cached(j, first, last) {
+        return Some(answer);
     }
-    let mut count = (last - first) * PAGE / KERNEL_PAGE;
-    j.found.resize(count.max(j.found.len()), 0);
-    let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // View memory the guards already hold cannot be write-watched: the
     // kernel asking would only fail. Copies of it are flushed many times a
     // frame, each time paying that failed call before the guards answer.
     let known_view = guarded && known_view(first * PAGE);
-    // SAFETY: the answer buffer holds `count` entries.
-    let failed = known_view
-        || unsafe {
-            GetWriteWatch(
-                WRITE_WATCH_FLAG_RESET,
-                (first * PAGE) as *const _,
-                (last - first) * PAGE,
-                j.found.as_mut_ptr().cast(),
-                &mut count,
-                &mut granularity,
-            )
-        } != 0;
+    let answer = if known_view { None } else { kernel_pages(j, first, last, Caller::Other) };
+    let failed = answer.is_none();
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         if known_view {
@@ -568,7 +731,6 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         failed_asking(first * PAGE, last * PAGE);
     }
     let guarded = if failed {
-        count = 0;
         if !guarded {
             return None;
         }
@@ -590,7 +752,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    note_found(j, count, now);
+    note_found(j, answer.unwrap_or(0), now);
     // guarded blocks are known by the 64 KiB only
     for page in guarded {
         note(j, page, now, u16::MAX);
@@ -682,13 +844,7 @@ const BLOCK: usize = PAGE;
 /// watch about it can only fail. `VICTORY_VIEW_ASK=1` (or
 /// `VICTORY_GUARD_ASK=1`) asks the kernel anyway, as before.
 fn known_view(start: usize) -> bool {
-    static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let ask = *ASK.get_or_init(|| {
-        ["VICTORY_VIEW_ASK", "VICTORY_GUARD_ASK"]
-            .iter()
-            .any(|n| std::env::var_os(n).is_some_and(|v| v == "1"))
-    });
-    if ask {
+    if force_view_ask() {
         return false;
     }
     let first = start / BLOCK;
@@ -750,6 +906,15 @@ impl ViewMemo {
 
 thread_local! {
     static VIEW_MEMO: std::cell::RefCell<ViewMemo> = std::cell::RefCell::new(ViewMemo::default());
+}
+
+fn force_view_ask() -> bool {
+    static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ASK.get_or_init(|| {
+        ["VICTORY_VIEW_ASK", "VICTORY_GUARD_ASK"]
+            .iter()
+            .any(|n| std::env::var_os(n).is_some_and(|v| v == "1"))
+    })
 }
 
 struct Guards {
@@ -1416,7 +1581,10 @@ fn writable(at: usize) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+mod submission_tests;
+
+#[cfg(test)]
+pub(crate) mod tests {
     use super::*;
 
     /// VICTORY_VIEW_MEMO: a remembered view block is forgotten once title
@@ -1485,6 +1653,19 @@ mod tests {
         let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
         assert!(later > now);
         assert_eq!(again, [(p / PAGE + 1, now)]);
+        // Run the submission boundaries and the copy's own seen-page
+        // bookkeeping together. The second submission must see the new
+        // store even though the first copied and reset this very page.
+        let copy = track(start, end - start, false).unwrap();
+        ask_once(&[(start, end)]);
+        copy.take(start, end);
+        ask_once_end();
+        // SAFETY: an ordinary store between submissions to the same page.
+        unsafe { ((p + PAGE + 8) as *mut u8).write_volatile(2) };
+        ask_once(&[(start, end)]);
+        assert_eq!(copy.take(start, end), [(p + PAGE, p + 2 * PAGE)]);
+        assert!(copy.take(start, end).is_empty());
+        ask_once_end();
         let mut plain = vec![0u8; PAGE];
         assert!(
             writes(
@@ -1791,7 +1972,7 @@ mod tests {
     /// A pagefile section mapped twice: two views of the same physical
     /// pages, the second left for the test; the section handle, the two
     /// addresses.
-    fn two_views(bytes: usize) -> (usize, usize, usize) {
+    pub(crate) fn two_views(bytes: usize) -> (usize, usize, usize) {
         use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile,
@@ -1820,7 +2001,7 @@ mod tests {
 
     /// The section of [`two_views`] is closed and its views unmapped; the
     /// guard is told they are gone first.
-    fn drop_views(section: usize, views: &[usize], bytes: usize) {
+    pub(crate) fn drop_views(section: usize, views: &[usize], bytes: usize) {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
         for &view in views {

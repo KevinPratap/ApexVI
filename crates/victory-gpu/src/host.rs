@@ -7946,6 +7946,7 @@ impl Meter {
         }
         let drawn = crate::draw::drawn();
         let frames = f64::from(self.frames);
+        let watch = crate::watch::asks_per_frame(frames);
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
@@ -8179,7 +8180,7 @@ impl Meter {
             }
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
-                 {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
+                 {copy_mb:.1} MB{watch}, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
@@ -8215,6 +8216,8 @@ impl Meter {
                     );
                 }
             }
+        } else if !watch.is_empty() {
+            tracing::info!("{fps:.1} fps, {ms:.1} ms/frame{watch}");
         }
         if self.caption.is_none() {
             // The window's own text, read without a message.
