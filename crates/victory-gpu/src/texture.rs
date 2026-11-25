@@ -1223,11 +1223,31 @@ impl Staging {
                 self.layout
                     .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
             {
+                if detile_zero() {
+                    // The level is zeros, not what the staging buffer held
+                    // before (a pooled buffer holds another texture's
+                    // bytes), and the levels after it are still detiled.
+                    tracing::debug!(?e, mip, slice, "texture level not detiled: zeros");
+                    linear.fill(0);
+                    continue;
+                }
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
             }
         }
     }
+}
+
+/// A level that does not detile (its memory too short, an unknown layout)
+/// is zero-filled and the texture's other levels are detiled
+/// (`VICTORY_DETILE_ZERO=1`; off by default). Without it the detile stops
+/// at that level, the staging buffer keeps what it held there and in every
+/// level after it, and the upload, recorded all the same (the buffer is
+/// marked dirty first), copies those bytes: zeros for a new buffer,
+/// another texture's for a pooled one (noise on the texture's surfaces).
+fn detile_zero() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DETILE_ZERO").is_some_and(|v| v == "1"))
 }
 
 /// Lets go of a title texture's staging buffer (lists that recorded an
