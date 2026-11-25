@@ -1778,6 +1778,71 @@ fn back_piece(
 /// compared, changed runs put in, and their bytes.
 static MERGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
+/// Why the title's bytes could not be put in beside flights' shader writes
+/// (`Shadow::merge_under_writes`), so that the flights were settled ("title
+/// memory changed under shader writes"): `VICTORY_SETTLE_WHY=1` (logging
+/// only) counts each case by the copy it happened in, and the frame-rate
+/// line's settle line is followed by the counts and the copies most often
+/// behind them.
+pub(crate) fn settle_why_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SETTLE_WHY").is_some_and(|v| v == "1"))
+}
+
+/// The cases of [`settle_why_on`].
+const SETTLE_WHY: [&str; 4] = [
+    "the copy is not write-watched",
+    "neither the journal, the kernel nor the guards could say what the title wrote",
+    "more changed runs than VICTORY_MERGE_RUNS left (a copy in the card's memory; VICTORY_MERGE_MASKED=1 has no such cap)",
+    "no snapshot to merge into (a copy on the CPU)",
+];
+
+/// Since the last line: per (case, copy start), the times and a size (runs
+/// asked for, or bytes, by case), with the copy's length.
+static SETTLE_SEEN: std::sync::Mutex<Option<std::collections::HashMap<(usize, usize), (u64, u64, u64)>>> =
+    std::sync::Mutex::new(None);
+
+fn settle_why(case: usize, start: usize, len: u64, size: usize) {
+    if !settle_why_on() {
+        return;
+    }
+    let mut seen = SETTLE_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let e = seen.get_or_insert_with(Default::default).entry((case, start)).or_insert((0, 0, len));
+    e.0 += 1;
+    e.1 += size as u64;
+}
+
+/// With [`settle_why_on`]: one line of the cases since the last one (per
+/// frame), and the 12 copies most often behind them.
+pub(crate) fn settle_why_line(frames: f64) {
+    if !settle_why_on() {
+        return;
+    }
+    let Some(seen) = SETTLE_SEEN.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
+    let mut cases = [0u64; 4];
+    for (&(case, _), &(n, _, _)) in &seen {
+        cases[case] += n;
+    }
+    let mut top: Vec<_> = seen.into_iter().collect();
+    top.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+    let named: Vec<String> = top
+        .iter()
+        .take(12)
+        .map(|&((case, start), (n, size, len))| {
+            format!("{start:#x}+{len:#x} case {case}: {:.2}/frame, size {:.0} each", n as f64 / frames, size as f64 / n.max(1) as f64)
+        })
+        .collect();
+    let counts: Vec<String> =
+        SETTLE_WHY.iter().zip(cases).map(|(what, n)| format!("{what}: {:.2}", n as f64 / frames)).collect();
+    tracing::info!(
+        "why title bytes could not go in beside flights' writes, per frame (VICTORY_SETTLE_WHY=1): {}; by copy: {}",
+        counts.join("; "),
+        named.join("; ")
+    );
+}
+
 /// [`MERGED`], taken.
 pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
@@ -3009,6 +3074,7 @@ impl Shadow {
             return false;
         }
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            settle_why(0, start, self.len, busy.len());
             return true;
         }
         let base = start / PAGE;
@@ -3021,6 +3087,7 @@ impl Shadow {
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
             let Some((now, written)) = crate::watch::writes(a, e, true) else {
+                settle_why(1, start, self.len, e - a);
                 return true;
             };
             let stale: Vec<usize> = {
@@ -3061,6 +3128,7 @@ impl Shadow {
                     }
                     let runs = joined_over(changed_runs(title, held), merge_gap());
                     if runs.len() > *runs_left {
+                        settle_why(2, start, self.len, runs.len());
                         return true;
                     }
                     *runs_left -= runs.len();
@@ -3072,6 +3140,7 @@ impl Shadow {
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
+                        settle_why(3, start, self.len, n);
                         return true;
                     };
                     // SAFETY: the snapshot's allocation holds the copy's
