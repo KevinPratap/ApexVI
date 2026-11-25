@@ -1197,12 +1197,34 @@ fn execute_now(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// One plane of a `PresentX` call (0x48-byte stride, from upstream #1997):
+/// frame token, resource count, and pointer to the plane's resources.
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    _rest: [u64; 6],
+}
+const _: () = assert!(std::mem::size_of::<Plane>() == 0x48);
+
+/// The first resource of every plane the title presents (at most 8), in
+/// plane order: the scene first, then overlays such as a Series S title's
+/// UI plane.
+#[cfg(windows)]
+fn plane_resources(planes: u32, plane_parameters: *const Plane) -> Vec<This> {
+    if planes == 0 || plane_parameters.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: the title passes `planes` plane descriptions.
+    let slice = unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) };
+    slice
+        .iter()
+        .filter(|p| p.count > 0 && !p.resources.is_null())
+        // SAFETY: the plane lists `count` resources.
+        .map(|p| unsafe { *p.resources })
+        .filter(|r| !r.is_null())
+        .collect()
 }
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
@@ -1395,12 +1417,18 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::profile::frame();
     // with VICTORY_PRESENT_LATER our thread runs the lines up to the present
+    // Several planes (a UI over the scene) are composed on this thread: the
+    // paths that show a frame elsewhere carry one resource.
     #[cfg(windows)]
-    let later = crate::present_later::on() && behind() && crate::host::late_free_present();
+    let shown = plane_resources(planes, plane_parameters);
+    #[cfg(windows)]
+    let several = shown.len() > 1;
+    #[cfg(windows)]
+    let later = !several && crate::present_later::on() && behind() && crate::host::late_free_present();
     // With `present_behind` (and not `later`): the frame is shown by our
     // thread, behind what the queue holds, and nothing is run or waited for here.
     #[cfg(windows)]
-    let sent_behind = !later && present_behind() && send_behind(this, planes, plane_parameters);
+    let sent_behind = !several && !later && present_behind() && send_behind(this, planes, plane_parameters);
     #[cfg(not(windows))]
     let _ = this;
     // Submissions sent to the card and not waited for are settled first,
@@ -1489,6 +1517,8 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
                 resource: resource as usize,
                 frame,
             });
+        } else if several {
+            show_planes(&shown, frame);
         } else {
             show(resource, frame);
         }
@@ -1496,6 +1526,45 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
     S_OK
+}
+
+/// Shows every plane: the first, with the later ones (a UI) drawn over it
+/// ([`crate::host::Host::present_planes`]). A plane whose resource has no
+/// host texture is left out.
+#[cfg(windows)]
+fn show_planes(resources: &[This], frame: u64) {
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    const COPY_SOURCE: u32 = 0x800;
+    // (title resource, host texture, state before, first time this texture is named)
+    let mut known: Vec<(This, windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32, bool)> = Vec::new();
+    for &resource in resources {
+        let Some(texture) = crate::resource::host_resource(resource) else {
+            continue;
+        };
+        use windows::core::Interface;
+        let earlier = known.iter().find_map(|(_, t, s, _)| (t.as_raw() == texture.as_raw()).then_some(*s));
+        let state = earlier.unwrap_or_else(|| {
+            crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before)
+        });
+        known.push((resource, texture.clone(), state, earlier.is_none()));
+    }
+    let Some(first) = known.first() else {
+        return;
+    };
+    let overlays: Vec<(&windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> =
+        known[1..].iter().map(|(_, t, s, _)| (t, *s)).collect();
+    let shown = host.present_planes(&first.1, first.2, &overlays, frame);
+    for (resource, _, state, own) in &known {
+        if *own {
+            crate::resource::host_transition(*resource, *state);
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    blinks(frame, first.0, first.2, shown);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = shown;
 }
 
 /// Shows `resource`, the first plane's first resource, in our window.

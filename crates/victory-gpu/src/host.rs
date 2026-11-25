@@ -7606,6 +7606,245 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     })
 }
 
+/// Planes a `PresentX` call names after the first (a Series S title's UI,
+/// drawn at 4K over its 1080p scene) are drawn over the scene into a
+/// texture of the scene's size, which is then shown as a single plane is:
+/// in the present's own list, so composing adds no submission or wait.
+/// The shaders and blending are those of upstream #1997 (Yaekai's #211):
+/// the scene opaque, then each later plane with premultiplied alpha.
+const COMPOSE: &str = r#"
+#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter = FILTER_MIN_MAG_MIP_LINEAR, addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP, visibility = SHADER_VISIBILITY_PIXEL)"
+Texture2D tex : register(t0);
+SamplerState smp : register(s0);
+[RootSignature(RS)]
+void vs(uint id : SV_VertexID, out float4 pos : SV_Position, out float2 uv : TEXCOORD) {
+    uv = float2((id << 1) & 2, id & 2);
+    pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+[RootSignature(RS)]
+float4 ps(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    return tex.Sample(smp, uv);
+}
+"#;
+
+/// Planes composed at most (the scene and seven over it).
+const COMPOSE_PLANES: u32 = 8;
+/// Presents whose views may be in the air at once: each present takes the
+/// next `COMPOSE_PLANES` views of a ring this many presents long.
+const COMPOSE_RING: u32 = 32;
+
+struct Composer {
+    /// The format the pipelines draw and the output is in.
+    format: DXGI_FORMAT,
+    root: ID3D12RootSignature,
+    opaque: ID3D12PipelineState,
+    overlay: ID3D12PipelineState,
+    rtv: ID3D12DescriptorHeap,
+    srv: ID3D12DescriptorHeap,
+    srv_step: u32,
+    next: u32,
+    /// The composed frame and its size, resting as a pixel-shader resource.
+    output: Option<(ID3D12Resource, u32, u32)>,
+}
+
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for Composer {}
+
+/// The composer, made when a present first names two planes (`Some(None)`:
+/// the host refused it, and only the first plane is shown).
+static COMPOSER: Mutex<Option<Option<Composer>>> = Mutex::new(None);
+
+impl Composer {
+    fn new(device: &ID3D12Device, format: DXGI_FORMAT) -> windows::core::Result<Self> {
+        let vs = compile(COMPOSE, windows::core::s!("vs"), windows::core::s!("vs_5_1"))?;
+        let ps = compile(COMPOSE, windows::core::s!("ps"), windows::core::s!("ps_5_1"))?;
+        // SAFETY: plain object creation from our compiled shaders.
+        unsafe {
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, &ps[..])?;
+            let pipeline = |blend: bool| -> windows::core::Result<ID3D12PipelineState> {
+                let mut target = D3D12_RENDER_TARGET_BLEND_DESC {
+                    RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
+                    ..Default::default()
+                };
+                if blend {
+                    target.BlendEnable = true.into();
+                    target.SrcBlend = D3D12_BLEND_ONE;
+                    target.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+                    target.BlendOp = D3D12_BLEND_OP_ADD;
+                    target.SrcBlendAlpha = D3D12_BLEND_ONE;
+                    target.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+                    target.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+                }
+                let mut blend_desc = D3D12_BLEND_DESC::default();
+                blend_desc.RenderTarget[0] = target;
+                let mut formats = [DXGI_FORMAT_UNKNOWN; 8];
+                formats[0] = format;
+                let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::ManuallyDrop::new(Some(root.clone())),
+                    VS: D3D12_SHADER_BYTECODE { pShaderBytecode: vs.as_ptr().cast(), BytecodeLength: vs.len() },
+                    PS: D3D12_SHADER_BYTECODE { pShaderBytecode: ps.as_ptr().cast(), BytecodeLength: ps.len() },
+                    BlendState: blend_desc,
+                    SampleMask: u32::MAX,
+                    RasterizerState: D3D12_RASTERIZER_DESC {
+                        FillMode: D3D12_FILL_MODE_SOLID,
+                        CullMode: D3D12_CULL_MODE_NONE,
+                        DepthClipEnable: false.into(),
+                        ..Default::default()
+                    },
+                    PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                    NumRenderTargets: 1,
+                    RTVFormats: formats,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    ..Default::default()
+                };
+                let made = device.CreateGraphicsPipelineState(&desc);
+                let _ = std::mem::ManuallyDrop::into_inner(desc.pRootSignature);
+                made
+            };
+            let opaque = pipeline(false)?;
+            let overlay = pipeline(true)?;
+            let rtv: ID3D12DescriptorHeap = device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                NumDescriptors: 1,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                NodeMask: 0,
+            })?;
+            let srv: ID3D12DescriptorHeap = device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: COMPOSE_PLANES * COMPOSE_RING,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })?;
+            let srv_step = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            Ok(Composer { format, root, opaque, overlay, rtv, srv, srv_step, next: 0, output: None })
+        }
+    }
+
+    /// The output texture for a `width` x `height` frame, made (again) when
+    /// the size changes; presents in the air that read the old one are
+    /// settled first.
+    fn output(&mut self, device: &ID3D12Device, width: u32, height: u32) -> Option<ID3D12Resource> {
+        if let Some((texture, w, h)) = &self.output
+            && (*w, *h) == (width, height)
+        {
+            return Some(texture.clone());
+        }
+        if self.output.is_some() {
+            settle_now(WHY_SYNC);
+        }
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: u64::from(width),
+            Height: height,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: self.format,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            Alignment: 0,
+        };
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: plain resource creation.
+        let made = unsafe {
+            device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                None,
+                &mut texture,
+            )
+        };
+        match (made, texture) {
+            (Ok(()), Some(texture)) => {
+                tracing::info!(width, height, format = self.format.0, "planes are composed into a frame of this size");
+                self.output = Some((texture.clone(), width, height));
+                Some(texture)
+            }
+            (made, _) => {
+                tracing::warn!(?made, width, height, "no texture to compose planes into: only the first is shown");
+                None
+            }
+        }
+    }
+
+    /// Records into `list` the scene and then `overlays` drawn over it into
+    /// `output`, which rests as a pixel-shader resource before and after.
+    /// Every plane is left in the state it came in.
+    ///
+    /// # Safety
+    /// `list` is open; the textures are live and in the states given.
+    unsafe fn record(
+        &mut self,
+        device: &ID3D12Device,
+        list: &ID3D12GraphicsCommandList,
+        output: &ID3D12Resource,
+        (width, height): (u32, u32),
+        scene: (&ID3D12Resource, D3D12_RESOURCE_STATES),
+        overlays: &[(&ID3D12Resource, u32)],
+    ) {
+        let planes: Vec<(&ID3D12Resource, D3D12_RESOURCE_STATES)> = std::iter::once(scene)
+            .chain(overlays.iter().map(|&(t, s)| (t, D3D12_RESOURCE_STATES(s as i32))))
+            .take(COMPOSE_PLANES as usize)
+            .collect();
+        let base = (self.next % COMPOSE_RING) * COMPOSE_PLANES;
+        self.next = self.next.wrapping_add(1);
+        // SAFETY: the caller's open list and live textures; our heaps.
+        unsafe {
+            let cpu = self.srv.GetCPUDescriptorHandleForHeapStart();
+            let gpu = self.srv.GetGPUDescriptorHandleForHeapStart();
+            let mut before = Vec::with_capacity(planes.len() + 1);
+            let mut after = Vec::with_capacity(planes.len() + 1);
+            for (i, &(texture, state)) in planes.iter().enumerate() {
+                let d = texture.GetDesc();
+                device.CreateShaderResourceView(
+                    texture,
+                    Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
+                        Format: swap_format(d.Format).unwrap_or(d.Format),
+                        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 1, PlaneSlice: 0, ResourceMinLODClamp: 0.0 },
+                        },
+                    }),
+                    D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu.ptr + ((base + i as u32) * self.srv_step) as usize },
+                );
+                let first = planes[..i].iter().all(|(earlier, _)| earlier.as_raw() != texture.as_raw());
+                if first && state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
+                    before.push(transition(texture, state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
+                    after.push(transition(texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, state));
+                }
+            }
+            before.push(transition(output, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET));
+            after.push(transition(output, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
+            list.ResourceBarrier(&before);
+            let rtv = self.rtv.GetCPUDescriptorHandleForHeapStart();
+            device.CreateRenderTargetView(output, None, rtv);
+            list.SetDescriptorHeaps(&[Some(self.srv.clone())]);
+            list.SetGraphicsRootSignature(&self.root);
+            list.RSSetViewports(&[D3D12_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: width as f32,
+                Height: height as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            }]);
+            list.RSSetScissorRects(&[RECT { left: 0, top: 0, right: width as i32, bottom: height as i32 }]);
+            list.OMSetRenderTargets(1, Some(&rtv), false, None);
+            list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            for i in 0..planes.len() as u32 {
+                list.SetPipelineState(if i == 0 { &self.opaque } else { &self.overlay });
+                list.SetGraphicsRootDescriptorTable(0, D3D12_GPU_DESCRIPTOR_HANDLE { ptr: gpu.ptr + u64::from((base + i) * self.srv_step) });
+                list.DrawInstanced(3, 1, 0, 0);
+            }
+            list.ResourceBarrier(&after);
+        }
+    }
+}
+
 const BUFFERS: u32 = 2;
 
 struct Presenter {
@@ -8019,13 +8258,32 @@ impl Host {
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+        self.present_planes(texture, state, &[], frame)
+    }
+
+    /// As [`Host::present`], with `overlays` (later planes, each a live host
+    /// texture in a host state it stays in) drawn over `texture` first
+    /// ([`Composer`]). If the composer cannot be made, only `texture` is shown.
+    pub(crate) fn present_planes(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        overlays: &[(&ID3D12Resource, u32)],
+        frame: u64,
+    ) -> Option<bool> {
         let showing = std::time::Instant::now();
-        let shown = self.present_now(texture, state, frame);
+        let shown = self.present_now(texture, state, overlays, frame);
         crate::framelog::add(crate::framelog::T::PresentShowUs, showing.elapsed().as_micros() as u64);
         shown
     }
 
-    fn present_now(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    fn present_now(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        overlays: &[(&ID3D12Resource, u32)],
+        frame: u64,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -8033,6 +8291,32 @@ impl Host {
             return None;
         };
         let (width, height) = (desc.Width as u32, desc.Height);
+        // With planes over the scene: the composer (made for the swap
+        // format) and its output, of the scene's size, so the swap chain
+        // keeps its size whether or not a UI plane comes with a frame.
+        let mut composer = COMPOSER.lock().unwrap_or_else(|e| e.into_inner());
+        let composing = if overlays.is_empty() {
+            None
+        } else {
+            if composer.as_ref().is_some_and(|c| c.as_ref().is_some_and(|c| c.format != format)) {
+                settle_now(WHY_SYNC);
+                *composer = None;
+            }
+            let made = composer.get_or_insert_with(|| match Composer::new(&self.device, format) {
+                Ok(c) => {
+                    tracing::info!(planes = overlays.len() + 1, format = format.0, "presents with several planes are composed");
+                    Some(c)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "planes cannot be composed: only the first is shown");
+                    None
+                }
+            });
+            match made.as_mut() {
+                Some(c) => c.output(&self.device, width, height).map(|out| (c, out)),
+                None => None,
+            }
+        };
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
             *presenter = match self.presenter(width, height, format) {
@@ -8101,6 +8385,16 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
+            // Planes over the scene: drawn into the composer's output, which
+            // is then shown in the scene's place.
+            let composed = composing.map(|(c, out)| {
+                c.record(&self.device, list, &out, (width, height), (texture, state), overlays);
+                out
+            });
+            let (texture, state) = match &composed {
+                Some(out) => (out, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+                None => (texture, state),
+            };
             list.ResourceBarrier(&[
                 transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
                 transition(
