@@ -2735,10 +2735,18 @@ mod fill_ahead {
     struct Piece {
         /// The frame its old fills were last dropped in.
         pruned: u64,
-        /// From, to, frame, and the number of the last submission started
-        /// when it read: the flights in the air then have that number or
-        /// a lower one, and only their writes can be ones it missed.
-        fills: Vec<(usize, usize, u64, u64)>,
+        /// By (from, to): the frame of its last fill and the number of the
+        /// last submission started when it read: the flights in the air
+        /// then have that number or a lower one, and only their writes can
+        /// be ones it missed. One entry for every fill of the same bytes:
+        /// the title fills the same constants every frame, and with every
+        /// fill kept (run batch6: 5,000 fills a frame ahead, 90,000 kept)
+        /// each landing's look-up walked them under the lock the
+        /// submitting thread takes for each fill (landing 35 -> 105 ms a
+        /// frame, preparing 91 -> 147). The last fill has the latest frame
+        /// and the highest submission number, so it is checked against
+        /// every flight an earlier fill of the same bytes was.
+        fills: HashMap<(usize, usize), (u64, u64)>,
     }
 
     /// The lowest submission number among the flights the landing thread
@@ -2799,9 +2807,9 @@ mod fill_ahead {
             let p = map.entry(piece).or_default();
             if p.pruned != frame {
                 p.pruned = frame;
-                p.fills.retain(|f| f.2 + KEEP >= frame);
+                p.fills.retain(|_, f| f.0 + KEEP >= frame);
             }
-            p.fills.push((src, src + len, frame, super::STARTED.load(Relaxed)));
+            p.fills.insert((src, src + len), (frame, super::STARTED.load(Relaxed)));
         }
     }
 
@@ -2819,7 +2827,7 @@ mod fill_ahead {
             let end = at + new.len();
             (at / PIECE..=(end - 1) / PIECE)
                 .filter_map(|piece| map.get(&piece))
-                .flat_map(|p| p.fills.iter().copied())
+                .flat_map(|p| p.fills.iter().map(|(&(from, to), &(read, started))| (from, to, read, started)))
                 .filter(|f| f.0 < end && f.1 > at && f.2 + KEEP >= frame && (landing == 0 || landing <= f.3))
                 .map(|f| (f.0, f.1, f.2))
                 .collect()
@@ -2888,7 +2896,7 @@ mod fill_ahead {
             let mut read = READ.lock().unwrap_or_else(|e| e.into_inner());
             read.as_mut().map_or(0, |map| {
                 map.retain(|_, p| {
-                    p.fills.retain(|f| f.2 + KEEP >= frame);
+                    p.fills.retain(|_, f| f.0 + KEEP >= frame);
                     !p.fills.is_empty()
                 });
                 map.values().map(|p| p.fills.len()).sum::<usize>()
