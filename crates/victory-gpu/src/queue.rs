@@ -63,8 +63,15 @@ enum Held {
     PresentMark,
     /// With [`present_behind`]: the title's present of a frame, due after
     /// what the queue holds before it: the host texture shown, the state
-    /// the title's lists leave it in, and the frame's number.
-    Present(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32, u64),
+    /// the title's lists leave it in, the planes drawn over it (a UI: host
+    /// texture and state each, [`crate::host::Host::present_planes`]), and
+    /// the frame's number.
+    Present(
+        windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        u32,
+        Vec<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)>,
+        u64,
+    ),
 }
 
 /// Presents that are in a queue's line and have not run ([`Held::Present`]).
@@ -135,11 +142,43 @@ fn present_behind() -> bool {
     }
 }
 
-/// With [`present_behind`]: puts the present of the next frame behind what
-/// the queue `this` holds. False if it has to run the old way.
+/// How many presents may be in the queues' lines at once
+/// ([`send_behind`]): `VICTORY_FRAMES_AHEAD=N`, 1 to 3; 1 by default, the
+/// title then at most one frame ahead of what is shown, as before. With 2
+/// the title may record a second frame while our thread still prepares the
+/// first (after Kelvaroq's patches 0046 and 0048, which hold two).
 #[cfg(windows)]
-fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool {
-    if this.is_null() || planes == 0 || PRESENTS_HELD.load(Ordering::Relaxed) != 0 {
+fn frames_ahead() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let n = std::env::var("VICTORY_FRAMES_AHEAD")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(1)
+            .clamp(1, 3);
+        if n != 1 {
+            tracing::info!(presents = n, "presents held in the queues' lines at most (VICTORY_FRAMES_AHEAD)");
+        }
+        n
+    })
+}
+
+/// Whether a frame with planes over the scene (a UI) goes behind the line
+/// too ([`send_behind`]): on with [`present_behind`];
+/// `VICTORY_ASYNC_PRESENT_PLANES=0` shows such frames on the title's
+/// thread, as before.
+#[cfg(windows)]
+fn planes_behind() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASYNC_PRESENT_PLANES").is_none_or(|v| v != "0"))
+}
+
+/// With [`present_behind`]: puts the present of the next frame, `shown`
+/// (the planes' resources, the scene first), behind what the queue `this`
+/// holds. False if it has to run the old way.
+#[cfg(windows)]
+fn send_behind(this: This, shown: &[This]) -> bool {
+    if this.is_null() || shown.is_empty() || PRESENTS_HELD.load(Ordering::Relaxed) >= frames_ahead() {
         return false;
     }
     let frame = FRAMES.load(Ordering::Relaxed) + 1;
@@ -148,27 +187,37 @@ fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool 
     if crate::capture::wanted(frame) || crate::capture::listed(frame) {
         return false;
     }
-    // SAFETY: the title passes `planes` plane descriptions.
-    let Some(plane) = (unsafe { plane_parameters.as_ref() }) else {
-        return false;
-    };
-    if plane.count == 0 || plane.resources.is_null() {
-        return false;
-    }
-    // SAFETY: the plane lists `count` resources.
-    let resource = unsafe { *plane.resources };
-    let Some(texture) = crate::resource::host_resource(resource) else {
-        return false;
-    };
-    // The state the lists recorded so far leave the texture in: what our
-    // copy finds it in when it runs behind them (looked at, not changed).
+    // Each plane's host texture and the state the lists recorded so far
+    // leave it in: what our copy finds it in when it runs behind them
+    // (looked at, not changed). A plane without a host texture is left
+    // out, as [`show_planes`] does; the scene's must be there.
     const COPY_SOURCE: u32 = 0x800;
-    let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
-    crate::resource::host_transition(resource, state);
-    let texture = texture.clone();
+    let mut known: Vec<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> = Vec::new();
+    for (i, &resource) in shown.iter().enumerate() {
+        let Some(texture) = crate::resource::host_resource(resource) else {
+            if i == 0 {
+                return false;
+            }
+            continue;
+        };
+        use windows::core::Interface;
+        let earlier = known.iter().find_map(|(t, s)| (t.as_raw() == texture.as_raw()).then_some(*s));
+        let state = earlier.unwrap_or_else(|| {
+            let state =
+                crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
+            crate::resource::host_transition(resource, state);
+            state
+        });
+        known.push((texture.clone(), state));
+    }
+    let mut known = known.into_iter();
+    let Some((texture, state)) = known.next() else {
+        return false;
+    };
+    let overlays: Vec<_> = known.collect();
     let sent = hold(this, || {
         PRESENTS_HELD.fetch_add(1, Ordering::Relaxed);
-        Held::Present(texture, state, frame)
+        Held::Present(texture, state, overlays, frame)
     });
     if sent {
         PRESENTS_BEHIND.fetch_add(1, Ordering::Relaxed);
@@ -922,10 +971,11 @@ fn release_held_now(all: bool) {
                             }
                         }
                     }
-                    Held::Present(texture, state, frame) => {
+                    Held::Present(texture, state, overlays, frame) => {
                         let show = || {
                             if let Some(host) = crate::host::host() {
-                                let _ = host.present(&texture, state, frame);
+                                let overlays: Vec<_> = overlays.iter().map(|(t, s)| (t, *s)).collect();
+                                let _ = host.present_planes(&texture, state, &overlays, frame);
                             }
                         };
                         if all {
@@ -1428,7 +1478,8 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     // With `present_behind` (and not `later`): the frame is shown by our
     // thread, behind what the queue holds, and nothing is run or waited for here.
     #[cfg(windows)]
-    let sent_behind = !several && !later && present_behind() && send_behind(this, planes, plane_parameters);
+    let sent_behind =
+        (!several || planes_behind()) && !later && present_behind() && send_behind(this, &shown);
     #[cfg(not(windows))]
     let _ = this;
     // Submissions sent to the card and not waited for are settled first,
