@@ -2094,12 +2094,32 @@ fn mip_drop_floor() -> u64 {
     })
 }
 
+/// Whether [`mip_drop`] takes uncompressed colour textures as well as
+/// block-compressed ones: `VICTORY_TEXTURE_MIP_DROP_COLOR=1` (off by
+/// default), within [`PLAIN_COLOUR`] and power-of-two sizes. A shader that
+/// reads such a texture by integer coordinate (Load) in the title's sizes
+/// reads outside the smaller host copy (zeros): which views are read that
+/// way is not known when the host copy is made.
+#[cfg(windows)]
+fn mip_drop_colour() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_MIP_DROP_COLOR").is_some_and(|v| v == "1"))
+}
+
+/// The uncompressed formats [`mip_drop_colour`] takes (DXGI numbers):
+/// R10G10B10A2_UNORM 24, R8G8B8A8_UNORM 28 and _SRGB 29, R8G8_UNORM 49,
+/// R8_UNORM 61, B8G8R8A8_UNORM 87, B8G8R8X8_UNORM 88, B8G8R8A8_UNORM_SRGB 91,
+/// B8G8R8X8_UNORM_SRGB 93.
+#[cfg(windows)]
+const PLAIN_COLOUR: [u32; 9] = [24, 28, 29, 49, 61, 87, 88, 91, 93];
+
 /// Why [`mip_drop`] left a texture whole, or that it did not
 /// ([`MIP_DROP_WHY`]): 0 levels left off, 1 the card writes it, 2 not 2D
-/// with one layer and one sample, 3 not block-compressed, 4 too few
+/// with one layer and one sample, 3 a format it does not take (not
+/// block-compressed, nor [`mip_drop_colour`]'s), 4 too few
 /// levels, 5 its top level would be under the floor (or not whole blocks).
 #[cfg(all(windows, feature = "diagnostics"))]
-const MIP_DROP_REASONS: [&str; 6] = ["left off", "card writes it", "not 2D/1 layer/1 sample", "not BCn", "too few levels", "under the floor"];
+const MIP_DROP_REASONS: [&str; 6] = ["left off", "card writes it", "not 2D/1 layer/1 sample", "format not taken", "too few levels", "under the floor"];
 
 /// Host copies made since the start by [`mip_drop`]'s verdict
 /// ([`MIP_DROP_REASONS`]): how many, and the bytes of the title's whole
@@ -2121,19 +2141,31 @@ fn mip_drop_rule(desc: &ResourceDesc, asked: u32, floor: u64) -> (usize, u32) {
         return (2, 0);
     }
     let format = pc_format(desc.format);
-    if !((70..=84).contains(&format) || (94..=99).contains(&format)) {
+    let (width, height) = (desc.width, u64::from(desc.height));
+    let block_compressed = (70..=84).contains(&format) || (94..=99).contains(&format);
+    // Uncompressed colour, with VICTORY_TEXTURE_MIP_DROP_COLOR=1: 8- and
+    // 10-bit UNORM and sRGB colour only (no integer or float formats, the
+    // data textures shaders read texel by texel), and only power-of-two
+    // sizes (upstream #2146: the others are screen-sized presentation art,
+    // whose titles copy level 0 alone; dropped, loading screens went flat).
+    let colour = !block_compressed
+        && mip_drop_colour()
+        && PLAIN_COLOUR.contains(&format)
+        && width.is_power_of_two()
+        && height.is_power_of_two();
+    if !block_compressed && !colour {
         return (3, 0);
     }
+    let block = if block_compressed { 4 } else { 1 };
     let mips = mip_count(desc);
     if mips <= 1 {
         return (4, 0);
     }
-    let (width, height) = (desc.width, u64::from(desc.height));
     let n = (1..=asked)
         .rev()
         .find(|&n| {
             let (w, h) = (width >> n, height >> n);
-            mips > n && w >= floor && h >= floor && w % 4 == 0 && h % 4 == 0
+            mips > n && w >= floor && h >= floor && w % block == 0 && h % block == 0
         })
         .unwrap_or(0);
     if n > 0 { (0, n) } else { (5, 0) }
