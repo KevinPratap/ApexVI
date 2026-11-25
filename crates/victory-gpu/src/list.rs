@@ -1371,6 +1371,14 @@ extern "system" fn clear_dsv(
     let _ = (this, handle, flags, depth, stencil, count, rects);
 }
 
+/// Whether `CopyMemoryToMemoryX` is a title buffer copy step rather than
+/// work of ours (`VICTORY_COPY_MEMORY_AS_COPY=1`; off by default).
+#[cfg(windows)]
+fn copy_memory_as_copy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_MEMORY_AS_COPY").is_some_and(|v| v == "1"))
+}
+
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
@@ -1380,6 +1388,18 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
         && src != 0
     {
         let len = len as usize;
+        // As a title buffer copy (`VICTORY_COPY_MEMORY_AS_COPY=1`): a step
+        // whose destination is known, so the submission's one write-watch
+        // asking stands (the journal is told what it wrote) and flights are
+        // waited for only where it reads or writes what they may write. As
+        // work of ours (`defer`), it ended the asking, every refresh after it
+        // asked the kernel again (about 100 askings a frame), and any flight
+        // in the air was settled for it. `copy_mapped` leaves a destination
+        // that is not all mapped alone, as the check below does.
+        if copy_memory_as_copy() {
+            list.defer_copy(dst as *mut u8, src as *const u8, len);
+            return;
+        }
         list.defer(move || {
             if crate::texture::committed(src as *const u8, len)
                 && crate::texture::committed(dst as *const u8, len)
