@@ -91,9 +91,42 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
     cached(cache, &build(), container, translate).map(|_| ran.load(Ordering::Relaxed))
 }
 
+/// Programs translated with the wave-wide form of 64-lane programs on a
+/// 32-lane host (`victory_shader::emit::with_wave_wide`), by the hash the
+/// log names them with (16 hex digits of the container's BLAKE3):
+/// `VICTORY_WAVE_WIDE_ONLY=<hash>,<hash>,...`; none by default. For the few
+/// a 32-lane card refuses ("Shader wants wave lane count of 64"), without
+/// `VICTORY_WAVE_WIDE=1` for every program (which lost the card on two
+/// particle programs). They are translated anew every run, outside the
+/// cache, whose key does not hold this list.
+fn wide_only(container: &[u8]) -> bool {
+    static LIST: OnceLock<Vec<String>> = OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        let list: Vec<String> = std::env::var("VICTORY_WAVE_WIDE_ONLY")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect();
+        if !list.is_empty() {
+            tracing::info!(programs = ?list, "translated with wave-wide branches (VICTORY_WAVE_WIDE_ONLY)");
+        }
+        list
+    });
+    if list.is_empty() {
+        return false;
+    }
+    let hash = blake3::hash(container).to_hex();
+    list.iter().any(|h| h.as_str() == &hash[..16])
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
+    if wide_only(container) {
+        return victory_shader::emit::with_wave_wide(|| victory_shader::emit::translate(container))
+            .map_err(|e| e.to_string());
+    }
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
