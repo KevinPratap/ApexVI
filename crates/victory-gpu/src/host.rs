@@ -2752,7 +2752,17 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         // buffer of its own, four a frame, 43 to 60 ms a
                         // frame) and neither side had other bytes after
                         // one. A copy INTO such a range still waits.
-                        if !touches(written, dst, dst + len) && fill_ahead::on_copies() && !fill_ahead::hot(src, len) {
+                        // With `copy_after_landing` a copy that reads what
+                        // flights may write is either made after they land or
+                        // left because its submission uses the destination:
+                        // that one waits (its source is the card's work, the
+                        // three a frame of run batch16 read results), never
+                        // ahead.
+                        if !touches(written, dst, dst + len)
+                            && !copy_after_landing()
+                            && fill_ahead::on_copies()
+                            && !fill_ahead::hot(src, len)
+                        {
                             if count {
                                 fill_ahead::read(src, len, true);
                             }
