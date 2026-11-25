@@ -56,7 +56,7 @@ fn calls_and_coverage_for_two_runs_in_one_reservation() {
     ask_nearby(&mut old, &pieces);
     ask_remaining(&mut old, &ranges);
     if count_asks() {
-        assert_eq!(old.stats.calls, [1, 1, 0, 0]);
+        assert_eq!(old.stats.calls, [1, 1, 0, 0, 0, 0, 0]);
         assert_eq!(
             old.stats.pages.iter().sum::<u64>(),
             (2 * width / KERNEL_PAGE) as u64
@@ -71,7 +71,7 @@ fn calls_and_coverage_for_two_runs_in_one_reservation() {
     assert!(new.kept);
     assert_eq!(new.ahead.len(), 2);
     if count_asks() {
-        assert_eq!(new.stats.calls, [1, 0, 0, 0]);
+        assert_eq!(new.stats.calls, [1, 0, 0, 0, 0, 0, 0]);
         assert_eq!(new.stats.pages[0], (3 * width / KERNEL_PAGE) as u64);
         eprintln!(
             "new calls {:?}, 4 KiB pages {:?}",
@@ -186,8 +186,8 @@ fn overlapping_copies_of_a_mapped_view_still_observe_alias_writes() {
     ask_reservations(&mut j, &pieces);
     assert!(j.kept && j.ahead.is_empty());
     if count_asks() {
-        assert_eq!(old.stats.calls, [32, 1, 30, 0]);
-        assert_eq!(j.stats.calls, [u64::from(force_view_ask()), 0, 0, 0]);
+        assert_eq!(old.stats.calls, [32, 1, 30, 0, 0, 0, 0]);
+        assert_eq!(j.stats.calls, [u64::from(force_view_ask()), 0, 0, 0, 0, 0, 0]);
     }
     // SAFETY: the other writable view faults into the existing write guard.
     unsafe { (alias as *mut u8).write_volatile(1) };
@@ -230,8 +230,8 @@ fn even_a_completely_dirty_answer_fits_in_one_call() {
         Some(0)
     );
     if count_asks() {
-        assert_eq!(j.stats.calls, [0, 0, 0, 2]);
-        assert_eq!(j.stats.pages, [0, 0, 0, (2 * PAGE / KERNEL_PAGE) as u64]);
+        assert_eq!(j.stats.calls, [0, 0, 0, 2, 0, 0, 0]);
+        assert_eq!(j.stats.pages, [0, 0, 0, (2 * PAGE / KERNEL_PAGE) as u64, 0, 0, 0]);
     }
 }
 
@@ -260,7 +260,7 @@ fn two_tiny_reads_do_not_walk_a_large_unrequested_gap() {
     ask_reservations(&mut j, &pages.map(|page| (page, page + 1)));
     assert_eq!(j.ahead.len(), 2);
     if count_asks() {
-        assert_eq!(j.stats.calls, [2, 0, 0, 0]);
+        assert_eq!(j.stats.calls, [2, 0, 0, 0, 0, 0, 0]);
         assert_eq!(j.stats.pages[0], (2 * PAGE / KERNEL_PAGE) as u64);
     }
 }

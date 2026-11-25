@@ -206,7 +206,7 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
     found: Vec::new(),
-    stats: AskStats { calls: [0; 4], pages: [0; 4] },
+    stats: AskStats { calls: [0; 7], pages: [0; 7] },
     ahead: Vec::new(),
     ordered: false,
     ahead_asked: 0,
@@ -224,12 +224,49 @@ enum Caller {
     Ahead,
     Run,
     Other,
+    Texture,
+    Merge,
+    Buffer,
+}
+
+/// Who asks through [`writes`] on this thread ([`asking_for`]), for
+/// `VICTORY_WATCH_STATS`: the askings outside a submission's one asking
+/// were all "other".
+#[derive(Clone, Copy)]
+pub(crate) enum Asker {
+    /// A staged texture's refresh (`crate::texture`).
+    Texture,
+    /// Title bytes put in beside flights' writes (`Shadow::merge_under_writes`).
+    Merge,
+    /// A buffer copy's refresh where no shader writes (`Shadow::update_free`).
+    Buffer,
+}
+
+thread_local! {
+    static ASKER: std::cell::Cell<Option<Asker>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` with its [`writes`] askings counted as `who`'s.
+pub(crate) fn asking_for<R>(who: Asker, f: impl FnOnce() -> R) -> R {
+    let before = ASKER.replace(Some(who));
+    let r = f();
+    ASKER.set(before);
+    r
+}
+
+fn asker() -> Caller {
+    match ASKER.get() {
+        Some(Asker::Texture) => Caller::Texture,
+        Some(Asker::Merge) => Caller::Merge,
+        Some(Asker::Buffer) => Caller::Buffer,
+        None => Caller::Other,
+    }
 }
 
 #[derive(Default)]
 struct AskStats {
-    calls: [u64; 4],
-    pages: [u64; 4],
+    calls: [u64; 7],
+    pages: [u64; 7],
 }
 
 fn count_asks() -> bool {
@@ -254,12 +291,15 @@ pub(crate) fn asks_per_frame(frames: f64) -> String {
     let stats = std::mem::take(&mut JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).stats);
     let pages = stats.pages.iter().sum::<u64>() as f64 / frames;
     let calls = stats.calls.iter().sum::<u64>() as f64 / frames;
-    let [once, ahead, run, other] = stats.calls.map(|n| n as f64 / frames);
-    let [once_pages, ahead_pages, run_pages, other_pages] = stats.pages.map(|n| n as f64 / frames);
+    let [once, ahead, run, other, texture, merge, buffer] = stats.calls.map(|n| n as f64 / frames);
+    let [once_pages, ahead_pages, run_pages, other_pages, texture_pages, merge_pages, buffer_pages] =
+        stats.pages.map(|n| n as f64 / frames);
     format!(
         ", GetWriteWatch/frame {calls:.1} calls covering {pages:.1} 4 KiB pages ({:.0} bytes), \
          calls/pages by caller (ask_once {once:.1}/{once_pages:.1}, ask_ahead {ahead:.1}/{ahead_pages:.1}, \
-         ask_run splits {run:.1}/{run_pages:.1}, other {other:.1}/{other_pages:.1})",
+         ask_run splits {run:.1}/{run_pages:.1}, texture refreshes {texture:.1}/{texture_pages:.1}, \
+         merges beside flights {merge:.1}/{merge_pages:.1}, buffer refreshes {buffer:.1}/{buffer_pages:.1}, \
+         other {other:.1}/{other_pages:.1})",
         pages * KERNEL_PAGE as f64
     )
 }
@@ -715,7 +755,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     // kernel asking would only fail. Copies of it are flushed many times a
     // frame, each time paying that failed call before the guards answer.
     let known_view = guarded && known_view(first * PAGE);
-    let answer = if known_view { None } else { kernel_pages(j, first, last, Caller::Other) };
+    let answer = if known_view { None } else { kernel_pages(j, first, last, asker()) };
     let failed = answer.is_none();
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
