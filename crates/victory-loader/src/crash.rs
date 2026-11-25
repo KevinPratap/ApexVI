@@ -370,12 +370,168 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     if unsafe { emulate_amd_only(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
+    // The title's own deliberate crash at a listed place (`VICTORY_STEP_OVER`):
+    // stepped over, the title goes on.
+    // SAFETY: as above.
+    if unsafe { (*(*info).ExceptionRecord).ExceptionCode } == EXCEPTION_ACCESS_VIOLATION
+        // SAFETY: as above.
+        && unsafe { step_over(&mut *(*info).ContextRecord) }
+    {
+        return -1; // EXCEPTION_CONTINUE_EXECUTION
+    }
     // SAFETY: as above.
     if FATAL.contains(&unsafe { (*(*info).ExceptionRecord).ExceptionCode }) {
         // SAFETY: as above.
         unsafe { report("first-chance exception", info, false) };
     }
     EXCEPTION_CONTINUE_SEARCH
+}
+
+/// Places in the title's image (offsets from its start, hex) where its own
+/// deliberate crash is stepped over: `VICTORY_STEP_OVER=2215c35,23cf683`;
+/// none by default. Only a `mov dword [0], imm32` there (`c7 04 25 00 00 00
+/// 00`, eleven bytes) is stepped over, with an `int3` right after it; any
+/// other instruction at a listed place is left to fault.
+///
+/// The two above are Grand Theft Auto VI's hang watchdog (image
+/// b99f876b74d4a77f): a thread that sleeps a second and then looks at up to
+/// 64 groups of 8 heartbeat stamps, and crashes on purpose when one is 300
+/// seconds old or more (at +0x2215c35, after calling its fatal hook, which
+/// crashes at +0x23cf683 when it is set). Stepped over, the watchdog goes on
+/// looking; a thread that really hangs still hangs.
+fn step_over_places() -> &'static [usize] {
+    static PLACES: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
+    PLACES.get_or_init(|| {
+        std::env::var("VICTORY_STEP_OVER")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|v| usize::from_str_radix(v.trim().trim_start_matches("0x").trim_start_matches("+"), 16).ok())
+            .collect()
+    })
+}
+
+/// The module containing `address`: its start and file name.
+fn module_base(address: usize) -> Option<(usize, String)> {
+    let mut module: HMODULE = std::ptr::null_mut();
+    // SAFETY: looks up the module containing `address`; no reference taken.
+    let found = unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            address as *const u16,
+            &mut module,
+        )
+    };
+    if found == 0 {
+        return None;
+    }
+    let mut path = [0u16; 260];
+    // SAFETY: `module` is a loaded module; the buffer length is passed.
+    let len = unsafe { GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32) };
+    let path = String::from_utf16_lossy(&path[..len as usize]);
+    Some((module as usize, path.rsplit('\\').next().unwrap_or(&path).to_owned()))
+}
+
+/// [`step_over_places`]: whether the access violation at `ctx.Rip` was
+/// stepped over (the instruction is skipped, and an `int3` after it).
+///
+/// # Safety
+/// `ctx` is the faulting thread's context.
+unsafe fn step_over(ctx: &mut CONTEXT) -> bool {
+    let places = step_over_places();
+    if places.is_empty() {
+        return false;
+    }
+    let rip = ctx.Rip as usize;
+    let Some((base, name)) = module_base(rip) else {
+        return false;
+    };
+    let rva = rip - base;
+    if !places.contains(&rva) {
+        return false;
+    }
+    // SAFETY: the faulting instruction's bytes, in the image's code.
+    let code = unsafe { std::slice::from_raw_parts(rip as *const u8, 12) };
+    if code[..7] != [0xc7, 0x04, 0x25, 0, 0, 0, 0] {
+        return false;
+    }
+    let skip = if code[11] == 0xcc { 12 } else { 11 };
+    let code_written = u32::from_le_bytes([code[7], code[8], code[9], code[10]]);
+    static TRIPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = TRIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n <= 5 || n.is_multiple_of(60) {
+        tracing::warn!(
+            trips = n,
+            place = format_args!("{name}+{rva:#x}"),
+            code = format_args!("{code_written:#x}"),
+            "the title's deliberate crash stepped over (VICTORY_STEP_OVER)"
+        );
+        if rva == WATCHDOG_TRIP && name.contains(WATCHDOG_IMAGE) {
+            // SAFETY: the image's own data, at its offsets in this build.
+            unsafe { watchdog_line(base) };
+        }
+    }
+    ctx.Rip += skip;
+    true
+}
+
+/// The hang watchdog's crash and its image (see [`step_over_places`]).
+const WATCHDOG_TRIP: usize = 0x2215c35;
+const WATCHDOG_IMAGE: &str = "b99f876b74d4a77f";
+
+/// At a trip of the watchdog: every heartbeat it looks at, with how old it
+/// is by the title's own scale and by the host's counter frequency (the two
+/// disagree if the stamps and the watchdog's clock do), the stale ones
+/// first. The table: 64 groups of 0x48 bytes at +0x6844a20, a count of
+/// stamps at +4 and up to 8 stamps from +8; the scale (seconds a tick, a
+/// float the title sets) at +0x9e4f5c0. Which thread owns a group is not in
+/// the table: the group's first dword is said as it is.
+///
+/// # Safety
+/// `base` is the start of image b99f876b74d4a77f.
+unsafe fn watchdog_line(base: usize) {
+    use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+    let (mut now, mut freq) = (0i64, 0i64);
+    // SAFETY: valid out pointers.
+    unsafe {
+        QueryPerformanceCounter(&mut now);
+        QueryPerformanceFrequency(&mut freq);
+    }
+    // SAFETY: the title's data, at its offsets in this image.
+    let scale = unsafe { std::ptr::read_volatile((base + 0x9e4f5c0) as *const f32) };
+    let table = base + 0x6844a20;
+    let mut stale = Vec::new();
+    let mut fresh = 0usize;
+    for group in 0..64usize {
+        let at = table + 0x48 * group;
+        // SAFETY: inside the table.
+        let (first, count) = unsafe {
+            (std::ptr::read_volatile(at as *const u32), std::ptr::read_volatile((at + 4) as *const u32))
+        };
+        for entry in 0..(count as usize).min(8) {
+            // SAFETY: inside the group.
+            let stamp = unsafe { std::ptr::read_volatile((at + 8 + 8 * entry) as *const u64) };
+            if stamp == 0 {
+                continue;
+            }
+            let ticks = now - stamp as i64;
+            let by_title = ticks as f64 * f64::from(scale);
+            let by_host = ticks as f64 / freq.max(1) as f64;
+            if by_title >= 250.0 || by_host >= 250.0 || ticks < 0 {
+                stale.push(format!(
+                    "group {group} (first word {first:#x}, {count} stamps) entry {entry}: stamp {stamp:#x}, {ticks} ticks ago, \
+                     {by_title:.1} s by the title's scale, {by_host:.1} s by the host's frequency"
+                ));
+            } else {
+                fresh += 1;
+            }
+        }
+    }
+    tracing::warn!(
+        "the title's hang watchdog tripped: now {now:#x}, host frequency {freq}/s, the title's scale {scale:e} s a tick \
+         (1/frequency is {:e}); {fresh} heartbeats fresh; stale or ahead: {}",
+        1.0 / freq.max(1) as f64,
+        if stale.is_empty() { "none (by these clocks)".to_owned() } else { stale.join("; ") }
+    );
 }
 
 /// For an unhandled-exception filter: reports the exception that is about
