@@ -2113,20 +2113,41 @@ fn mip_drop_colour() -> bool {
 #[cfg(windows)]
 const PLAIN_COLOUR: [u32; 9] = [24, 28, 29, 49, 61, 87, 88, 91, 93];
 
+/// The largest a host copy's top level may stay, in texels on its larger
+/// side: `VICTORY_TEXTURE_MIP_CAP=N` (64 to 16384; none by default).
+/// [`mip_drop`] then leaves off only as many levels (at most
+/// `VICTORY_TEXTURE_MIP_DROP`) as bring a texture to the cap, and a texture
+/// at or under it keeps its top level: the big textures give up memory,
+/// the ones close-ups show at 1024 and under stay sharp. With
+/// `VICTORY_TEXTURE_MIP_DROP=3 VICTORY_TEXTURE_MIP_CAP=1024`, 4096 and 2048
+/// textures are made 1024; 1024 and smaller stay as they are.
+#[cfg(windows)]
+fn mip_drop_cap() -> Option<u64> {
+    static CAP: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MIP_CAP")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|c| c.clamp(64, 16384))
+    })
+}
+
 /// Why [`mip_drop`] left a texture whole, or that it did not
 /// ([`MIP_DROP_WHY`]): 0 levels left off, 1 the card writes it, 2 not 2D
 /// with one layer and one sample, 3 a format it does not take (not
 /// block-compressed, nor [`mip_drop_colour`]'s), 4 too few
-/// levels, 5 its top level would be under the floor (or not whole blocks).
+/// levels, 5 its top level would be under the floor (or not whole blocks),
+/// 6 at or under [`mip_drop_cap`] already.
 #[cfg(all(windows, feature = "diagnostics"))]
-const MIP_DROP_REASONS: [&str; 6] = ["left off", "card writes it", "not 2D/1 layer/1 sample", "format not taken", "too few levels", "under the floor"];
+const MIP_DROP_REASONS: [&str; 7] =
+    ["left off", "card writes it", "not 2D/1 layer/1 sample", "format not taken", "too few levels", "under the floor", "at or under the cap"];
 
 /// Host copies made since the start by [`mip_drop`]'s verdict
 /// ([`MIP_DROP_REASONS`]): how many, and the bytes of the title's whole
 /// descriptions.
 #[cfg(windows)]
-static MIP_DROP_WHY: [[std::sync::atomic::AtomicU64; 2]; 6] =
-    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 6];
+static MIP_DROP_WHY: [[std::sync::atomic::AtomicU64; 2]; 7] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 7];
 
 /// [`mip_drop`]'s rules for `desc`, with `asked` levels and `floor`: the
 /// reason ([`MIP_DROP_REASONS`]) and the levels left off (0 unless the
@@ -2168,7 +2189,19 @@ fn mip_drop_rule(desc: &ResourceDesc, asked: u32, floor: u64) -> (usize, u32) {
             mips > n && w >= floor && h >= floor && w % block == 0 && h % block == 0
         })
         .unwrap_or(0);
-    if n > 0 { (0, n) } else { (5, 0) }
+    if n == 0 {
+        return (5, 0);
+    }
+    // With a cap (`VICTORY_TEXTURE_MIP_CAP`): only as many levels as bring
+    // the larger side to the cap or under it; a texture there already
+    // keeps all of its own.
+    match mip_drop_cap() {
+        Some(cap) => {
+            let needed = (0..=n).find(|&k| width.max(height) >> k <= cap).unwrap_or(n);
+            if needed == 0 { (6, 0) } else { (0, needed) }
+        }
+        None => (0, n),
+    }
 }
 
 /// For the memory line (`VICTORY_TEXTURE_MIP_DROP` on): host copies made
@@ -2185,7 +2218,7 @@ pub(crate) fn mip_drop_line() {
     }
     let floor = mip_drop_floor();
     // [reason] -> (count, bytes); then (count, bytes) qualifying at 128 and at 64
-    let mut without = [[0u64; 2]; 6];
+    let mut without = [[0u64; 2]; 7];
     let mut lower = [[0u64; 2]; 2];
     for &at in textures().iter() {
         // SAFETY: as in `census`.
