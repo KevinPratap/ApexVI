@@ -1238,6 +1238,13 @@ impl State {
         if !self.bind(list, p, false) {
             return false;
         }
+        // The sky as the title reflects it: the ambient light follows it
+        // (Belobug's VICTORY_AMBIENT_SKY).
+        if p.stages.iter().any(|s| s.shader.draws_sky)
+            && let Some(&sky) = self.targets.first()
+        {
+            crate::ambient::sky_drawn(sky);
+        }
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -2530,7 +2537,11 @@ impl State {
     /// After a dispatch of `p`: the least indirect light, if it is the
     /// program that resolves that (`crate::ambient`, after Belobug's fork).
     fn ambient(&self, list: &HostList, p: &HostPipeline) -> bool {
-        let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
+        let Some(stage) = p
+            .stages
+            .first()
+            .filter(|s| s.shader.resolves_light || s.shader.ends_reflections)
+        else {
             return false;
         };
         let Some(t) = stage.shader.translated() else {
@@ -2547,6 +2558,14 @@ impl State {
             };
             crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
         };
+        if !stage.shader.resolves_light {
+            // The reflections, held to the light around (Belobug's
+            // VICTORY_AMBIENT_REFLECT).
+            return match view(ResourceType::Uav, crate::ambient::REFLECTIONS) {
+                Some(View::Unordered(r, ..)) if r != 0 => crate::ambient::hold(list, r as This),
+                _ => false,
+            };
+        }
         let light = match view(ResourceType::Uav, crate::ambient::LIGHT) {
             Some(View::Unordered(r, ..)) => r,
             _ => 0,
