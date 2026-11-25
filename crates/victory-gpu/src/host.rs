@@ -2653,9 +2653,9 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         // buffer of its own, four a frame, 43 to 60 ms a
                         // frame) and neither side had other bytes after
                         // one. A copy INTO such a range still waits.
-                        if !touches(written, dst, dst + len) && fill_ahead::on() && !fill_ahead::hot(src, len) {
+                        if !touches(written, dst, dst + len) && fill_ahead::on_copies() && !fill_ahead::hot(src, len) {
                             if count {
-                                fill_ahead::read(src, len);
+                                fill_ahead::read(src, len, true);
                             }
                             continue;
                         }
@@ -2673,7 +2673,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         // (`fill_ahead`).
                         if fill_ahead::on() && !fill_ahead::hot(src, len) {
                             if count {
-                                fill_ahead::read(src, len);
+                                fill_ahead::read(src, len, false);
                             }
                             continue;
                         }
@@ -2758,7 +2758,7 @@ mod fill_ahead {
         /// frame, preparing 91 -> 147). The last fill has the latest frame
         /// and the highest submission number, so it is checked against
         /// every flight an earlier fill of the same bytes was.
-        fills: HashMap<(usize, usize), (u64, u64)>,
+        fills: HashMap<(usize, usize), (u64, u64, bool)>,
     }
 
     /// The lowest submission number among the flights the landing thread
@@ -2805,9 +2805,32 @@ mod fill_ahead {
         *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_WAIT").is_none_or(|v| v != "1")) && !WAIT.load(Relaxed)
     }
 
-    /// A fill reads `len` bytes at `src` ahead of flights that may write
-    /// them.
-    pub(super) fn read(src: usize, len: usize) {
+    /// A title buffer copy found to have read bytes a flight then changed
+    /// makes copies wait from then on, fills not ([`copy_miss`]).
+    static WAIT_COPIES: AtomicBool = AtomicBool::new(false);
+
+    /// Whether a miss of a read-only copy makes only copies wait
+    /// (`VICTORY_FILL_AHEAD_COPY_MISS=1`; off by default: any miss makes
+    /// fills and copies wait). Run batch13: fills that waited for flights,
+    /// 1,519, read the same bytes after the wait every time (small reads in
+    /// the 174 MB buffer a flight declares whole); the copies that missed
+    /// read a buffer the title's shaders do write every frame (three 2 KB
+    /// copies a frame from 0x98cf7e000), and the one miss that turned the
+    /// waiting on was such a copy: from there every fill waited too, about
+    /// one settle a frame.
+    fn copy_miss() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_AHEAD_COPY_MISS").is_some_and(|v| v == "1"))
+    }
+
+    /// [`on`] for read-only title buffer copies.
+    pub(super) fn on_copies() -> bool {
+        on() && !WAIT_COPIES.load(Relaxed)
+    }
+
+    /// A fill (or, `copy`, a read-only title buffer copy) reads `len` bytes
+    /// at `src` ahead of flights that may write them.
+    pub(super) fn read(src: usize, len: usize, copy: bool) {
         if len == 0 {
             return;
         }
@@ -2821,7 +2844,13 @@ mod fill_ahead {
                 p.pruned = frame;
                 p.fills.retain(|_, f| f.0 + KEEP >= frame);
             }
-            p.fills.insert((src, src + len), (frame, super::STARTED.load(Relaxed)));
+            // A range read both ways counts as a fill: a fill's miss is the
+            // stricter one.
+            let started = super::STARTED.load(Relaxed);
+            p.fills
+                .entry((src, src + len))
+                .and_modify(|f| *f = (frame, started, f.2 && copy))
+                .or_insert((frame, started, copy));
         }
     }
 
@@ -2833,15 +2862,15 @@ mod fill_ahead {
         }
         let frame = crate::frame::current();
         let landing = LANDING.load(Relaxed);
-        let hits: Vec<(usize, usize, u64)> = {
+        let hits: Vec<(usize, usize, u64, bool)> = {
             let read = READ.lock().unwrap_or_else(|e| e.into_inner());
             let Some(map) = read.as_ref() else { return };
             let end = at + new.len();
             (at / PIECE..=(end - 1) / PIECE)
                 .filter_map(|piece| map.get(&piece))
-                .flat_map(|p| p.fills.iter().map(|(&(from, to), &(read, started))| (from, to, read, started)))
+                .flat_map(|p| p.fills.iter().map(|(&(from, to), &(read, started, copy))| (from, to, read, started, copy)))
                 .filter(|f| f.0 < end && f.1 > at && f.2 + KEEP >= frame && (landing == 0 || landing <= f.3))
-                .map(|f| (f.0, f.1, f.2))
+                .map(|f| (f.0, f.1, f.2, f.4))
                 .collect()
         };
         if hits.is_empty() {
@@ -2849,7 +2878,7 @@ mod fill_ahead {
         }
         COUNT[1].fetch_add(1, Relaxed);
         let mut now = Vec::new();
-        for (from, to, read_in) in hits {
+        for (from, to, read_in, copy) in hits {
             let (a, b) = (from.max(at), to.min(at + new.len()));
             now.clear();
             now.resize(b - a, 0);
@@ -2881,6 +2910,19 @@ mod fill_ahead {
                             a + first
                         );
                     }
+                }
+                continue;
+            }
+            if copy && copy_miss() {
+                if !WAIT_COPIES.swap(true, Relaxed) {
+                    tracing::warn!(
+                        "a title buffer copy read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders \
+                         changed them (first at {:#x}, landed in frame {frame}): the lists of that submission drew with the \
+                         bytes from before. Copies wait for flights again from here on, fills not \
+                         (VICTORY_FILL_AHEAD_COPY_MISS=1; {n} such reads)",
+                        to - from,
+                        a + first
+                    );
                 }
                 continue;
             }
@@ -2922,7 +2964,13 @@ mod fill_ahead {
             ahead as f64 / frames,
             looked as f64 / frames,
             COUNT[2].load(Relaxed),
-            if WAIT.load(Relaxed) { " (fills wait again)" } else { "" },
+            if WAIT.load(Relaxed) {
+                " (fills wait again)"
+            } else if WAIT_COPIES.load(Relaxed) {
+                " (copies wait again, fills not)"
+            } else {
+                ""
+            },
             HOT_COUNT.load(Relaxed)
         );
     }
