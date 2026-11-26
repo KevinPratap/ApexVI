@@ -10933,8 +10933,16 @@ impl<'a> Lower<'a> {
                 .min(self.s.threads.map_or(u32::MAX, |t| t[0]))
         });
         let mut indices = [z; 3];
+        let corner_mask = {
+            static NINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *NINE.get_or_init(|| std::env::var_os("VICTORY_MESH_9BIT_CORNERS").is_some_and(|v| v == "1")) {
+                0x1FF
+            } else {
+                0x3FF
+            }
+        };
         for (k, slot) in indices.iter_mut().enumerate() {
-            let (shift, mask) = (self.s.m.i32(10 * k as u32), self.s.m.i32(0x3FF));
+            let (shift, mask) = (self.s.m.i32(10 * k as u32), self.s.m.i32(corner_mask));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
             if let Some(n) = written {
