@@ -5148,11 +5148,12 @@ mod card_merge_tests {
         };
         const N: usize = 4;
         const LEN: usize = 16 << 10;
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
         unsafe {
             let base = mem::VirtualAlloc(
                 std::ptr::null(),
                 N * LEN,
-                mem::MEM_RESERVE | mem::MEM_COMMIT | mem::MEM_WRITE_WATCH,
+                mem::MEM_RESERVE | mem::MEM_COMMIT | MEM_WRITE_WATCH,
                 mem::PAGE_READWRITE,
             )
             .cast::<u8>();
