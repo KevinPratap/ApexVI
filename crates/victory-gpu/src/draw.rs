@@ -2479,8 +2479,6 @@ impl State {
                     let print = crate::texture::fingerprint(at, len);
                     let (wait, next_looks) = if recheck_changing {
                         (1, CHANGING_BIT)
-                    } else if crate::texture::texture_changing() {
-                        (1, 0)
                     } else {
                         (RECHECK_FRAMES[0], 0)
                     };
