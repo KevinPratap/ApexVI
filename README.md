@@ -18,7 +18,7 @@ Tested on one machine: Windows 11, RTX 4050 Laptop (6 GB), Intel i7-12650H,
 |---|---|
 | Menus, loading screens, account picker | visible (the UI plane is composed, see below), 30 fps |
 | Opening and the first room | lit and textured, the in-game hints show |
-| Frame rate in the world | **about 7 fps** (140 ms a frame), from 4.8 (210 ms) at the start of this fork |
+| Frame rate in the world | **about 7.5 fps** (133 ms a frame), from 4.8 (210 ms) at the start of this fork |
 | Stability | 8-10 minute scripted runs with no crash or device loss; the title's own hang watchdog is stepped over |
 | Not playable yet | yes: one thread's preparation is the limit, see "Help wanted" |
 
@@ -91,7 +91,8 @@ Measure on your machine and say what you see (GPU, CPU, RAM, fps by scene).
 log. The open work, biggest first:
 
 1. **Split the submit thread's preparation** ([docs/prep-split-plan.md](docs/prep-split-plan.md)):
-   Design A (journal lock split, heap sync and merges on the idle wide threads,
+   Design A: step A0 (journal lock split, `VICTORY_JOURNAL_SPLIT`, with refreshes on
+   several threads, `VICTORY_WIDE_REFRESH`) is in; heap sync and merges on the wide threads,
    about 9 fps here) is in progress; Design B (two submissions in preparation)
    after it, toward the card-bound ceiling of about 11-12 fps on this laptop.
 2. **Ray-traced passes**: about 400 draws a frame are the ray-tracing structure
