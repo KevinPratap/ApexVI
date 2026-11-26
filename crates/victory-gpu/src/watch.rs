@@ -1529,6 +1529,27 @@ fn uncommitted_region(block: usize) -> (usize, usize, bool) {
 /// ours, `crate::host::copy_mapped`) goes through one view, and every
 /// guard over the pages must copy them again.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
+    open_with(g, start, end, false)
+}
+
+/// Whether a write fault opens only the view that was written and leaves
+/// the page's other views read-only, no longer clean
+/// (`VICTORY_OPEN_ONE_VIEW=1`; off by default: opens them all). After the
+/// 7900XTX fork (avatarmanz), where 586 faults a frame opened 880 blocks:
+/// each other view opened was a change of protection under the guards'
+/// lock, with other faults waiting, and made read-only again when the page
+/// was next taken, though the title writes through one of them. A view
+/// left read-only and not clean is written at the next asking (its copies
+/// take the page) and noted clean again with no change of protection; a
+/// write through it faults, and opens it.
+fn open_one_view() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_OPEN_ONE_VIEW").is_some_and(|v| v == "1"))
+}
+
+/// [`open`]; with `one_view`, the other views of the pages are left
+/// read-only and only noted not clean ([`open_one_view`]).
+fn open_with(g: &mut Guards, start: usize, end: usize, one_view: bool) -> bool {
     let any = open_here(g, start, end);
     if start >= end || g.aliased.is_empty() {
         return any;
@@ -1537,7 +1558,10 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     for block in aliased {
         g.aliased.remove(&block);
         for alias in crate::inplace::pages_of(block * BLOCK) {
-            if alias / BLOCK != block && open_here(g, alias, alias.saturating_add(BLOCK)) {
+            if one_view && alias / BLOCK != block {
+                // Its copies no longer hold the page; still read-only.
+                g.clean.remove(&(alias / BLOCK));
+            } else if alias / BLOCK != block && open_here(g, alias, alias.saturating_add(BLOCK)) {
                 #[cfg(feature = "diagnostics")]
                 ALIASES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -1823,7 +1847,7 @@ fn install() {
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
         let mut g = guards();
-        if open(&mut g, at, at + 1) {
+        if open_with(&mut g, at, at + 1, open_one_view()) {
             if !rest().is_zero() {
                 g.opened(at / BLOCK);
                 REST_COUNTS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
