@@ -1052,8 +1052,7 @@ impl Staging {
                 waited(1, || crate::watch::asking_for(crate::watch::Asker::Texture, || crate::watch::writes(start, start + size, true)))
         {
             const HASH_EVERY: u64 = 8;
-            static CHANGING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            let check_changing = *CHANGING.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CHANGING").is_some_and(|v| v == "1"));
+            let check_changing = texture_changing();
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
@@ -1282,6 +1281,12 @@ pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let (at, len) = map.as_ref()?.get(&(resource as usize))?.memory();
     Some((at as u64, len as u64))
+}
+
+/// Whether dynamic/video textures re-check every frame once seen changing (`VICTORY_TEXTURE_CHANGING=1`).
+pub(crate) fn texture_changing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CHANGING").is_some_and(|v| v == "1"))
 }
 
 /// A fingerprint of the title memory `[at, at + len)`, never 0: of all of

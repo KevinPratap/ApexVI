@@ -2239,17 +2239,46 @@ impl State {
             // first look for the rest of the run. The look reads 48 KiB;
             // only a changed texture is uploaded again.
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
+            const CHANGING_BIT: u8 = 0x80;
+            let mut recheck_changing = false;
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
                 if pass_timed(6, || crate::texture::fingerprint(at, len)) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
-                    match RECHECK_FRAMES.get(usize::from(looks) + 1) {
-                        Some(wait) => {
-                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
+                    if looks & CHANGING_BIT != 0 && crate::texture::texture_changing() {
+                        let idle = (looks & 0x7f).saturating_add(1);
+                        if idle < 120 {
+                            host.texture_slot_recheck(
+                                index,
+                                write,
+                                frame + 1,
+                                (at, len),
+                                print,
+                                CHANGING_BIT | idle,
+                                uploaded,
+                            );
+                        } else {
+                            host.texture_slot_recheck(
+                                index,
+                                write,
+                                frame + RECHECK_FRAMES[2],
+                                (at, len),
+                                print,
+                                2,
+                                uploaded,
+                            );
                         }
-                        None => host.texture_slot_done(index, write, None),
+                    } else {
+                        let step = looks & 0x7f;
+                        match RECHECK_FRAMES.get(usize::from(step) + 1) {
+                            Some(wait) => {
+                                host.texture_slot_recheck(index, write, frame + wait, (at, len), print, step + 1, uploaded)
+                            }
+                            None => host.texture_slot_done(index, write, None),
+                        }
                     }
                     continue;
                 }
+                recheck_changing = crate::texture::texture_changing();
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
                 if n < 200 || n.is_multiple_of(1000) {
                     tracing::warn!(
@@ -2257,7 +2286,7 @@ impl State {
                         address = format_args!("{at:#x}"),
                         bytes = len,
                         frames_after_upload = frame.saturating_sub(uploaded),
-                        looks,
+                        looks = looks & 0x7f,
                         changed = n + 1,
                         "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
                     );
@@ -2448,7 +2477,14 @@ impl State {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
                     let print = crate::texture::fingerprint(at, len);
-                    host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), print, 0, frame);
+                    let (wait, next_looks) = if recheck_changing {
+                        (1, CHANGING_BIT)
+                    } else if crate::texture::texture_changing() {
+                        (1, 0)
+                    } else {
+                        (RECHECK_FRAMES[0], 0)
+                    };
+                    host.texture_slot_recheck(index, write, frame + wait, (at, len), print, next_looks, frame);
                 }
                 None => host.texture_slot_done(index, write, again),
             }
