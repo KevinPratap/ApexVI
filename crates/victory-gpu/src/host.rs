@@ -221,9 +221,46 @@ pub(crate) fn submissions_started() -> u64 {
 /// before). The mirroring takes none of the locks the submitting thread
 /// holds while it waits for the join (`submitted` above all: the
 /// descriptor code never settles, executes or submits).
+/// `VICTORY_PREP_SPLIT=1`: a submission's heap mirroring on a kept thread
+/// beside its copies' preparing (A1). `=2`: also spreads per-copy merges
+/// under shader writes across the kept threads (A2). `=alt` / `=alt2`:
+/// twenty seconds on (`1` or `2`), twenty off (`0`), in turn, logged on
+/// each flip so one run A/Bs the same scene.
+fn prep_split_mode() -> u8 {
+    /// 0 off, 1 = A1, 2 = A1+A2, 3 = alt (0/1), 4 = alt2 (0/2).
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_PREP_SPLIT").ok().as_deref().map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
+        Some("alt") => 3,
+        Some("alt2") => 4,
+        _ => 0,
+    })
+}
+
+pub(crate) fn prep_split_configured() -> bool {
+    prep_split_mode() != 0
+}
+
 pub(crate) fn prep_split() -> u8 {
-    static LEVEL: OnceLock<u8> = OnceLock::new();
-    *LEVEL.get_or_init(|| std::env::var("VICTORY_PREP_SPLIT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+    match prep_split_mode() {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        m => {
+            let target = if m == 4 { 2u8 } else { 1u8 };
+            let level = if (now_us() / 20_000_000) % 2 == 1 { target } else { 0 };
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(255);
+            if LAST.swap(level, Ordering::Relaxed) != level {
+                tracing::info!(
+                    "submission preparation split from now (VICTORY_PREP_SPLIT={}): {}",
+                    if m == 4 { "alt2" } else { "alt" },
+                    if level > 0 { format!("ON (level {level})") } else { "off, as usual".into() }
+                );
+            }
+            level
+        }
+    }
 }
 
 /// With [`prep_split`]: microseconds the submitting thread waited at the
@@ -3389,7 +3426,7 @@ mod fill_check {
 /// may write and that the title wrote since it was last copied. The
 /// refresh leaves ranges shaders are writing alone (`Shadow::update`), so
 /// the title's bytes there would reach the card a submission late.
-fn stale_under_flights(runs: &[&HostList]) -> bool {
+fn stale_under_flights(runs: &[&HostList], wide: bool) -> bool {
     use std::sync::Arc;
     // Per copy, the span of what is refreshed (a flush brings that much
     // up to date at most).
@@ -3415,10 +3452,31 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         // runs a frame of a few bytes each, and the cap of 512 settled the
         // flights twice a frame, 50 ms of the submitting thread.)
         static RUNS: OnceLock<usize> = OnceLock::new();
-        let mut runs_left = *RUNS.get_or_init(|| {
+        let cap = *RUNS.get_or_init(|| {
             std::env::var("VICTORY_MERGE_RUNS").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(512, |n| n.clamp(1, 1 << 16))
         });
-        return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
+        let runs_left = std::sync::atomic::AtomicUsize::new(cap);
+        if wide && spans.len() >= 2 {
+            spans.sort_unstable_by_key(|s| std::cmp::Reverse(s.2 - s.1));
+            let state = Arc::new((runs_left, std::sync::atomic::AtomicBool::new(false)));
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = spans
+                .into_iter()
+                .map(|(shadow, from, to)| {
+                    let state = state.clone();
+                    Box::new(move || {
+                        if state.1.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        if shadow.merge_under_writes(from, to - from, &state.0) {
+                            state.1.store(true, Ordering::Relaxed);
+                        }
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            crate::shadow::wide_run(jobs);
+            return state.1.load(Ordering::Relaxed);
+        }
+        return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &runs_left));
     }
     spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
 }
@@ -5846,7 +5904,8 @@ impl Host {
         // command lists that index those slots are submitted: beside the
         // copies' preparing with `prep_split` (joined below), in place when
         // a sweep is due (it must not run beside or before the mirroring).
-        let heaps = if prep_split() >= 1 && !sweep_due() {
+        let split = prep_split();
+        let heaps = if split >= 1 && !sweep_due() {
             Some(crate::shadow::wide_start(Box::new(crate::descriptor::sync_heaps)))
         } else {
             crate::descriptor::sync_heaps();
@@ -5928,13 +5987,13 @@ impl Host {
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
-            if behind && stale_under_flights(runs) {
+            if behind && stale_under_flights(runs, split >= 2) {
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
                 crate::watch::ask_once(&ranges);
             }
-        } else if behind && stale_under_flights(runs) {
+        } else if behind && stale_under_flights(runs, split >= 2) {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
@@ -8355,7 +8414,7 @@ impl Meter {
         crate::watch::rest_line(frames);
         crate::watch::bits_line(frames);
         #[cfg(feature = "diagnostics")]
-        if prep_split() >= 1 {
+        if prep_split_configured() {
             static WAS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let now = HEAPS_JOINED.load(Ordering::Relaxed);
             let waited = now.saturating_sub(WAS.swap(now, Ordering::Relaxed)) as f64 / 1000.0 / frames;
