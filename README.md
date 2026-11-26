@@ -9,18 +9,19 @@ work of several forks together and measures every change on one modest machine.
 copy of the game. It is not affiliated with or endorsed by the game's developer
 or publisher. As in other forks, the title is not named here.
 
-## Where it stands (2026-11-26)
+## Where it stands (2026-11-27)
 
-Tested on one machine: Windows 11, RTX 4050 Laptop (6 GB), Intel i7-12650H,
-32 GB RAM, the Series S profile (`--console series-s`), 1080p.
+Tested on one machine: Windows 11, NVIDIA RTX 4050 Laptop (**6 GB VRAM**, 32-lane waves),
+Intel Core i7-12650H, 32 GB RAM, the Series S profile (`--console series-s`), 1920x1080.
 
 | | |
 |---|---|
-| Menus, loading screens, account picker | visible and sharp (the UI plane is composed; UI and loading art kept at full size), 30 fps |
-| Opening and the first room | lit and textured, the in-game hints show |
-| Frame rate in the world | **about 7.5 fps** (133 ms a frame), from 4.8 (210 ms) at the start of this fork |
-| Stability | 8-10 minute scripted runs with no crash or device loss; the title's own hang watchdog is stepped over |
-| Not playable yet | yes: one thread's preparation is the limit, see "Help wanted" |
+| Menus, loading screens, account picker | visible, sharp and responsive at **30 fps** (both `PresentX` planes composed; UI and loading art kept at full size) |
+| Character control, HUD, audio | controllable in the world (movement, camera, HUD prompts, pause/menus, audio); played from the opening room through the yard to the outdoor pier/parking scene |
+| Picture in the world | lit and textured on 6 GB VRAM: whole character torsos and wire-mesh windows (`VICTORY_MESH_9BIT_CORNERS`), clean BC7 clothing (`VICTORY_BC7_ROTATION`), indirect garbage clamp (`VICTORY_INDIRECT_ZERO_GARBAGE`) |
+| Frame rate in the world | **6.35-7.5 fps** by scene (133-158 ms/frame; outdoor pier ~6.35 fps, opening room ~7.5 fps), up from 4.8 fps (210 ms) at the start of this fork |
+| Stability | **14-15 minute** continuous runs with no crash or device loss; the title's hang watchdog is stepped over |
+| Known limits on this 6 GB laptop | CPU submit-thread preparation (~102-135 ms/frame) caps frame rate below full speed; interiors without direct light rely on the ambient stand-in while ray-traced passes do not run |
 
 ### Where a frame goes
 
@@ -60,7 +61,7 @@ Each change is opt-in behind a `VICTORY_*` switch, described where it is read;
   (`VICTORY_MERGE_BUFFERS`, `VICTORY_MERGE_CHUNKS`).
 - **Light**: the ambient stand-in with reflections held and the sky followed
   (`VICTORY_AMBIENT_REFLECT`, `VICTORY_AMBIENT_SKY`, from Belobug's fork).
-- **UI and loading art at full size** while world textures shrink (`VICTORY_TEXTURE_MIP_DROP_UI_FULL=2`: what a draw into a presented image samples is kept whole), **whole character torsos and wire-mesh geometry** (`VICTORY_MESH_9BIT_CORNERS=1`: 9-bit mesh primitive corner indices, dropping bit-9 edge flags so edge-flagged triangles are not culled, from upstream #1718 / `c0228d9`), **clean BC7 clothing blocks** (`VICTORY_BC7_ROTATION=1`: BC7 channel rotation restricted to modes 4 and 5, from upstream #3111), and **no black blink** while a new picture uploads (`VICTORY_KEEP_SHOWN`, `VICTORY_SHOW_AFTER`, after the VIctory-7900XTX fork).
+- **UI and loading art at full size** while world textures shrink (`VICTORY_TEXTURE_MIP_DROP_UI_FULL=2`: what a draw into a presented image samples is kept whole), **whole character torsos and wire-mesh geometry** (`VICTORY_MESH_9BIT_CORNERS=1`: 9-bit mesh primitive corner indices, dropping bit-9 edge flags so edge-flagged triangles are not culled, from upstream #1718 / `c0228d9`), **clean BC7 clothing blocks** (`VICTORY_BC7_ROTATION=1`: BC7 channel rotation restricted to modes 4 and 5, from upstream #3111), **clamped indirect mesh records and 16-bit SDWA sign-extension** (`VICTORY_INDIRECT_ZERO_GARBAGE=1`, `VICTORY_SDWA_SEXT_16=1`, from upstream #1799 / #3124 and `voidopcode/vilocity`), **full-view dirty-page and rotating-texture refreshes** (`VICTORY_PAGE_WRITES=all`, `VICTORY_TEXTURE_CHANGING=1`, from `fxceless/victory-fork` #602 / #1314), **console sync UAV barriers** (`VICTORY_SYNC_BARRIER=1`, from `realblastex/flamingo`), **zero camera jitter under spatial upscaling** (`VICTORY_SPATIAL_NO_JITTER=1`), and **no black blink** while a new picture uploads (`VICTORY_KEEP_SHOWN`, `VICTORY_SHOW_AFTER`, after the VIctory-7900XTX fork).
 - **Parallel preparation and smaller physical sections**: heap mirroring and per-copy merges on wide threads (`VICTORY_PREP_SPLIT=2`), parallel staged-texture refresh checks (`VICTORY_PARALLEL_REFRESH=1`, from fxceless's fork), and 2 MiB physical-page sections (`VICTORY_SECTION_MB=2`, from upstream #3177: remap stalls 7.3 -> 1.3 ms/frame).
 - **Stability**: the title's hang watchdog stepped over with a log of the
   stale heartbeat (`VICTORY_STEP_OVER`); four 64-lane programs the 32-lane host
@@ -118,7 +119,8 @@ A tree of other people's work; ported commits name their source.
 - **[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)**: guard rest, one view opened at a fault, fine pages.
 - **[fablinoo/kelvaroq](https://github.com/fablinoo/kelvaroq)**: write watch per reservation, frames ahead.
 - **[realblastex/flamingo](https://github.com/realblastex/flamingo)**: the fast path settings and console pipeline sync barrier.
-- Upstream pull requests #1718, #1997 (Yaekai, Calvix2k), #2146, #3111 (RVZO6), #3177 (KainanP, RyanCase94, CuteBooty).
+- **[voidopcode/vilocity](https://github.com/voidopcode/vilocity)**: remaining list budget preserved when clamping oversized indirect mesh records.
+- Upstream pull requests #1718, #1799, #1997 (Yaekai, Calvix2k), #2146, #3111 (RVZO6), #3124, #3177 (KainanP, RyanCase94, CuteBooty).
 - Changes in this fork were made with [Claude Code](https://claude.com/claude-code).
 
 ## License
