@@ -8001,7 +8001,8 @@ impl<'a> Lower<'a> {
             let k16 = self.s.m.i32(16);
             let shifted = self.s.m.bin(c, Bin::Shl, x, k16);
             let r = self.s.m.bin(c, Bin::AShr, shifted, k16);
-            return self.write_v(reg, r, guard);
+            self.write_placed(inst, Reg::V(reg), r, guard);
+            return Ok(());
         }
         let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
             Some(Ok(o)) if keep => o,
