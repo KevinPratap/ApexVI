@@ -151,6 +151,56 @@ fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
     Some((heap, heap.index(handle)?))
 }
 
+/// With `host::show_after`: makes the slots whose texture's upload has run
+/// (their submission `<= finished`), each found again by its handle (the
+/// heap may have gone) and made only if the title slot still holds the
+/// record it was written with (written again since: that write is in the
+/// queue of textures picked by index). Returns how many were made.
+#[cfg(windows)]
+pub(crate) fn texture_flips(finished: u64) -> usize {
+    use host::{FLIPPED, FLIPS, record_key};
+    use std::sync::atomic::Ordering::Relaxed;
+    let due: Vec<(u64, u64, u64, u64)> = {
+        let mut flips = FLIPS.lock().unwrap_or_else(|e| e.into_inner());
+        if flips.is_empty() {
+            return 0;
+        }
+        let (due, wait) = flips.drain(..).partition(|f| f.0 <= finished);
+        *flips = wait;
+        due
+    };
+    let frame = crate::frame::current();
+    let mut made = 0;
+    for (_, handle, key, asked) in due {
+        let slot = shader_slot(handle).filter(|_| record_key(handle) == key);
+        let Some((heap, index)) = slot else {
+            FLIPPED[2].fetch_add(1, Relaxed);
+            continue;
+        };
+        if let Some(Some(host)) = heap.host.get() {
+            if !host.made_from(index, handle) {
+                host.mirror(index, handle, true);
+            }
+            made += 1;
+            let waited = frame.saturating_sub(asked);
+            let n = FLIPPED[1].fetch_add(1, Relaxed) + 1;
+            FLIPPED[3].fetch_add(waited, Relaxed);
+            FLIPPED[4].fetch_max(waited, Relaxed);
+            if n.is_power_of_two() {
+                tracing::info!(
+                    "slots shown after their texture's upload (VICTORY_SHOW_AFTER=1), since the start: {n} made of {} queued, {} dropped \
+                     (written again or gone); {:.2} frames waited on average, {} at most",
+                    FLIPPED[0].load(Relaxed),
+                    FLIPPED[2].load(Relaxed),
+                    FLIPPED[3].load(Relaxed) as f64 / n as f64,
+                    FLIPPED[4].load(Relaxed)
+                );
+            }
+        }
+    }
+    made
+}
+
 /// Makes the host descriptor for what the title wrote at `handle`, if it
 /// is in a shader-visible heap.
 #[cfg(windows)]
