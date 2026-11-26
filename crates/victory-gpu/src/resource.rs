@@ -1161,6 +1161,8 @@ struct Hosted {
     gone: std::sync::atomic::AtomicBool,
     /// A texture of [`PLACED_TEXTURES`].
     placed: std::sync::atomic::AtomicBool,
+    /// Kept whole: drawn to the screen ([`want_whole`]).
+    whole: std::sync::atomic::AtomicBool,
 }
 
 /// Counts for the memory line: host copies of textures the title fills
@@ -1351,7 +1353,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             Some(texture) => Some(texture),
             // Without its top levels if asked for ([`mip_drop`]); as the
             // title described it if the host will not make that.
-            None => match mip_drop(&r.desc) {
+            None => match if r.host.whole.load(Relaxed) { mip_drop_whole(&r.desc) } else { mip_drop(&r.desc) } {
                 0 => host_texture(&r.desc, r.host.state, clear),
                 n => {
                     let mut smaller = r.desc;
@@ -1772,6 +1774,7 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 #[cfg(windows)]
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
+    unpark();
     const IDLE_FRAMES: u64 = 4;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
@@ -2137,17 +2140,143 @@ fn mip_drop_cap() -> Option<u64> {
 /// with one layer and one sample, 3 a format it does not take (not
 /// block-compressed, nor [`mip_drop_colour`]'s), 4 too few
 /// levels, 5 its top level would be under the floor (or not whole blocks),
-/// 6 at or under [`mip_drop_cap`] already.
+/// 6 at or under [`mip_drop_cap`] already, 7 kept whole as screen-shaped
+/// ([`mip_drop_ui_full`]), 8 kept whole as drawn to the screen
+/// ([`want_whole`]).
 #[cfg(all(windows, feature = "diagnostics"))]
-const MIP_DROP_REASONS: [&str; 7] =
-    ["left off", "card writes it", "not 2D/1 layer/1 sample", "format not taken", "too few levels", "under the floor", "at or under the cap"];
+const MIP_DROP_REASONS: [&str; 9] = [
+    "left off",
+    "card writes it",
+    "not 2D/1 layer/1 sample",
+    "format not taken",
+    "too few levels",
+    "under the floor",
+    "at or under the cap",
+    "kept whole as screen-shaped",
+    "kept whole as drawn to the screen",
+];
 
 /// Host copies made since the start by [`mip_drop`]'s verdict
 /// ([`MIP_DROP_REASONS`]): how many, and the bytes of the title's whole
 /// descriptions.
 #[cfg(windows)]
-static MIP_DROP_WHY: [[std::sync::atomic::AtomicU64; 2]; 7] =
-    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 7];
+static MIP_DROP_WHY: [[std::sync::atomic::AtomicU64; 2]; 9] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 9];
+
+/// Whether [`mip_drop`] keeps screen-shaped textures whole
+/// (`VICTORY_TEXTURE_MIP_DROP_UI_FULL=1`; off by default): a top level
+/// whose sides are not both powers of two, or of about 16:9 or 21:9. The
+/// title's loading art and interface pictures are shaped like the screen,
+/// its world's textures almost never; with levels left off the loading
+/// art went visibly blurred and blocky (intro frame 3104, MIP_DROP=2
+/// against 0). Uncompressed colour already keeps the sizes that are not
+/// powers of two whole (upstream #2146); this is the same for the
+/// block-compressed ones. What it costs shows as its own reason in the
+/// census.
+///
+/// `=2` also keeps whole every texture a draw into a presented image samples
+/// (the screen's pictures, square or not: the loading art is), its host copy
+/// made again whole if it was made with levels left off ([`want_whole`]).
+#[cfg(windows)]
+fn mip_drop_ui_full() -> bool {
+    mip_drop_ui_level() >= 1
+}
+
+/// [`mip_drop_ui_full`]'s level: 0 off, 1 by shape, 2 also by use.
+#[cfg(windows)]
+pub(crate) fn mip_drop_ui_level() -> u8 {
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        if mip_drop_asked() == 0 {
+            return 0;
+        }
+        std::env::var("VICTORY_TEXTURE_MIP_DROP_UI_FULL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0).min(2)
+    })
+}
+
+/// [`want_whole`]: host copies taken out to be made again whole, kept
+/// until two seconds have passed (a recording thread may still hold a
+/// reference it was given a moment ago), then retired (dropped once the
+/// submissions running then have finished, which the frames on the card
+/// read them in).
+#[cfg(windows)]
+static PARKED: std::sync::Mutex<Vec<(std::time::Instant, Made)>> = std::sync::Mutex::new(Vec::new());
+
+/// Retires the parked copies older than two seconds.
+#[cfg(windows)]
+fn unpark() {
+    let old: Vec<Made> = {
+        let mut parked = PARKED.lock().unwrap_or_else(|e| e.into_inner());
+        let (old, keep): (Vec<_>, Vec<_>) = parked.drain(..).partition(|(at, _)| at.elapsed().as_secs() >= 2);
+        *parked = keep;
+        old.into_iter().map(|(_, made)| made).collect()
+    };
+    for made in old {
+        crate::host::retire(made);
+    }
+}
+
+/// With [`mip_drop_ui_level`] 2: title texture `this` is drawn to the
+/// screen, so it is kept whole from now on; if its host copy left levels
+/// off, the copy is taken out (the next use makes it whole) and its staging
+/// state with it (so it is uploaded again). True if a copy was taken out:
+/// the slots that show it are to be made again.
+#[cfg(windows)]
+pub(crate) fn want_whole(this: This) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if this.is_null() || mip_drop_ui_level() < 2 {
+        return false;
+    }
+    let r = resource(this);
+    if r.host.whole.swap(true, Relaxed) {
+        return false;
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if LOGGED.fetch_add(1, Relaxed) < 64 {
+            tracing::info!(
+                width = r.desc.width,
+                height = r.desc.height,
+                levels = mip_count(&r.desc),
+                format = pc_format(r.desc.format),
+                "mip drop: a texture drawn to the screen is kept whole (VICTORY_TEXTURE_MIP_DROP_UI_FULL=2)"
+            );
+        }
+    }
+    let taken = {
+        let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: a live host copy.
+        let dropped = made.as_ref().is_some_and(|(host, _)| levels_left_off(&r.desc, &unsafe { host.texture.GetDesc() }) > 0);
+        if dropped {
+            crate::texture::unstage(this);
+            made.take()
+        } else {
+            None
+        }
+    };
+    unpark();
+    let Some(made) = taken else {
+        return false;
+    };
+    REMADE_WHOLE.fetch_add(1, Relaxed);
+    PARKED.lock().unwrap_or_else(|e| e.into_inner()).push((std::time::Instant::now(), made));
+    true
+}
+
+/// [`want_whole`]: host copies taken out to be made again whole, since the
+/// start.
+#[cfg(windows)]
+pub(crate) static REMADE_WHOLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`mip_drop_ui_full`]'s shape test of a top level `width` x `height`.
+fn screen_shaped(width: u64, height: u64) -> bool {
+    let near = |a: u64, b: u64| a.abs_diff(b) * 50 <= a.max(b);
+    !width.is_power_of_two()
+        || !height.is_power_of_two()
+        || near(width * 9, height * 16)
+        || near(width * 9, height * 21)
+}
 
 /// [`mip_drop`]'s rules for `desc`, with `asked` levels and `floor`: the
 /// reason ([`MIP_DROP_REASONS`]) and the levels left off (0 unless the
@@ -2195,13 +2324,17 @@ fn mip_drop_rule(desc: &ResourceDesc, asked: u32, floor: u64) -> (usize, u32) {
     // With a cap (`VICTORY_TEXTURE_MIP_CAP`): only as many levels as bring
     // the larger side to the cap or under it; a texture there already
     // keeps all of its own.
-    match mip_drop_cap() {
+    let (why, n) = match mip_drop_cap() {
         Some(cap) => {
             let needed = (0..=n).find(|&k| width.max(height) >> k <= cap).unwrap_or(n);
             if needed == 0 { (6, 0) } else { (0, needed) }
         }
         None => (0, n),
+    };
+    if why == 0 && mip_drop_ui_full() && screen_shaped(width, height) {
+        return (7, 0);
     }
+    (why, n)
 }
 
 /// For the memory line (`VICTORY_TEXTURE_MIP_DROP` on): host copies made
@@ -2218,7 +2351,7 @@ pub(crate) fn mip_drop_line() {
     }
     let floor = mip_drop_floor();
     // [reason] -> (count, bytes); then (count, bytes) qualifying at 128 and at 64
-    let mut without = [[0u64; 2]; 7];
+    let mut without = [[0u64; 2]; 9];
     let mut lower = [[0u64; 2]; 2];
     for &at in textures().iter() {
         // SAFETY: as in `census`.
@@ -2276,6 +2409,21 @@ pub(crate) static MIP_DROPPED: [std::sync::atomic::AtomicU64; 2] = [const { std:
 /// and its new top level at least [`mip_drop_floor`] texels and whole
 /// blocks each way. Fewer levels if that is all such a texture allows;
 /// 0 for any other texture.
+/// [`mip_drop`] of a texture kept whole ([`want_whole`]): none, counted
+/// as such where it would have left levels off.
+#[cfg(windows)]
+fn mip_drop_whole(desc: &ResourceDesc) -> u32 {
+    let asked = mip_drop_asked();
+    if asked == 0 {
+        return 0;
+    }
+    let (why, _) = mip_drop_rule(desc, asked, mip_drop_floor());
+    let why = if why == 0 || why == 7 { 8 } else { why };
+    MIP_DROP_WHY[why][0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    MIP_DROP_WHY[why][1].fetch_add(footprint(desc).map_or(0, |f| f.size), std::sync::atomic::Ordering::Relaxed);
+    0
+}
+
 #[cfg(windows)]
 fn mip_drop(desc: &ResourceDesc) -> u32 {
     let asked = mip_drop_asked();
@@ -2283,6 +2431,21 @@ fn mip_drop(desc: &ResourceDesc) -> u32 {
         return 0;
     }
     let (why, n) = mip_drop_rule(desc, asked, mip_drop_floor());
+    // The first screen-shaped textures kept whole, for finding the
+    // title's pictures among them.
+    #[cfg(feature = "diagnostics")]
+    if why == 7 {
+        static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 64 {
+            tracing::info!(
+                width = desc.width,
+                height = desc.height,
+                levels = mip_count(desc),
+                format = pc_format(desc.format),
+                "mip drop: a screen-shaped texture kept whole (VICTORY_TEXTURE_MIP_DROP_UI_FULL=1)"
+            );
+        }
+    }
     MIP_DROP_WHY[why][0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     MIP_DROP_WHY[why][1].fetch_add(footprint(desc).map_or(0, |f| f.size), std::sync::atomic::Ordering::Relaxed);
     n
@@ -2575,6 +2738,7 @@ fn hand_out_resource(
             used: std::sync::atomic::AtomicU64::new(0),
             refused: std::sync::atomic::AtomicBool::new(false),
             gone: std::sync::atomic::AtomicBool::new(false),
+            whole: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
         },
     });
@@ -3105,6 +3269,20 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// VICTORY_TEXTURE_MIP_DROP_UI_FULL: screen-shaped top levels (not both
+    /// powers of two, or about 16:9 or 21:9) are told from the world's
+    /// square and power-of-two textures.
+    #[test]
+    fn screen_shaped_textures() {
+        use super::screen_shaped;
+        for (w, h) in [(1920, 1080), (1280, 720), (3840, 2160), (2560, 1080), (1000, 1000), (2048, 1152)] {
+            assert!(screen_shaped(w, h), "{w}x{h}");
+        }
+        for (w, h) in [(2048, 2048), (1024, 512), (4096, 1024), (512, 1024), (256, 256)] {
+            assert!(!screen_shaped(w, h), "{w}x{h}");
+        }
+    }
     use crate::object::slot;
 
     type Release = extern "system" fn(This) -> u32;

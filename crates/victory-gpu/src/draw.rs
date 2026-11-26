@@ -318,6 +318,9 @@ pub(crate) struct State {
     target_handles: Vec<u64>,
     depth_handle: u64,
     targets_set: bool,
+    /// A target bound now was presented lately: what the draws read is the
+    /// screen's (`VICTORY_TEXTURE_MIP_DROP_UI_FULL=2`).
+    targets_presented: bool,
     viewports: Vec<D3D12_VIEWPORT>,
     scissors: Vec<RECT>,
     blend: Option<[f32; 4]>,
@@ -957,6 +960,16 @@ impl State {
     }
 
     /// Render targets and depth, set on the host list at once.
+    /// `readable` for what a draw reads through a table, and with
+    /// `VICTORY_TEXTURE_MIP_DROP_UI_FULL=2`, a texture drawn into a presented
+    /// image kept whole (`crate::descriptor::host::mark_whole`).
+    fn readable_marked(&self, list: &HostList, kind: ResourceType, view: &View) {
+        readable(list, kind, view);
+        if self.targets_presented {
+            crate::descriptor::host::mark_whole(view);
+        }
+    }
+
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
         let Some(host) = crate::host::host() else {
             return;
@@ -966,6 +979,7 @@ impl State {
         self.depth_handle = depth;
         self.targets_set = true;
         self.targets.clear();
+        self.targets_presented = false;
         let mut rtvs = Vec::new();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
@@ -991,6 +1005,9 @@ impl State {
                 continue;
             };
             self.targets.push(record.resource as usize);
+            if crate::resource::mip_drop_ui_level() >= 2 && crate::host::presented_lately(texture.as_raw() as usize) {
+                self.targets_presented = true;
+            }
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
             rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
@@ -2129,6 +2146,9 @@ impl State {
         // Levels on demand: the slots of textures whose first level with
         // memory changed since the last pass are made again from it.
         host.texture_views_remade();
+        // Textures made whole (`VICTORY_TEXTURE_MIP_DROP_UI_FULL=2`): their
+        // slots made again from the new copies, and due.
+        host.texture_views_rewhole(frame);
         // And with room, the textures whose upload left a held level
         // without the card's memory are uploaded again.
         if room {
@@ -2318,11 +2338,27 @@ impl State {
                     );
                 }
             }
-            let view = pass_timed(8, || heap.handle(index).and_then(|handle| host.mirror(index, handle, true)));
+            // A slot not made from what it holds now is shown once its
+            // texture's upload has run (`show_after`): made at once, the
+            // frames already on the card read the new host texture empty.
+            let late = crate::descriptor::host::show_after()
+                && heap.handle(index).is_some_and(|handle| !host.made_from(index, handle));
+            let view = pass_timed(8, || {
+                heap.handle(index).and_then(|handle| {
+                    if late { crate::descriptor::view(handle) } else { host.mirror(index, handle, true) }
+                })
+            });
+            // Nothing of this pass uploads it: made now after all.
+            let at_once = || {
+                if late && let Some(handle) = heap.handle(index) {
+                    let _ = host.mirror(index, handle, true);
+                }
+            };
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
                 _ => {
+                    at_once();
                     host.texture_slot_done(index, write, None);
                     continue;
                 }
@@ -2330,6 +2366,7 @@ impl State {
             let title_fills = crate::resource::host_resource(resource).is_some_and(crate::texture::title_written);
             if !title_fills {
                 // a render target, a depth or unordered access texture: the host's own
+                at_once();
                 host.texture_slot_done(index, write, None);
                 continue;
             }
@@ -2370,6 +2407,14 @@ impl State {
             };
             if again.is_some() {
                 HEAP_TEXTURES_PARTLY[1].fetch_add(1, Ordering::Relaxed);
+            }
+            if late && let Some(handle) = heap.handle(index) {
+                if tabled {
+                    // Draws that read it through a table upload it.
+                    let _ = host.mirror(index, handle, true);
+                } else {
+                    host.flip_after(list, handle);
+                }
             }
             if tabled {
                 // Nothing was staged here, so nothing is counted or spent,
@@ -3074,7 +3119,7 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u.kind, &view);
+                        self.readable_marked(list, u.kind, &view);
                     }
                 }
                 for k in selected {
@@ -3085,7 +3130,7 @@ impl State {
                     if let Some(view) = crate::descriptor::view(handle)
                         && let Some(kind) = view_kind(&view)
                     {
-                        readable(list, kind, &view);
+                        self.readable_marked(list, kind, &view);
                     }
                 }
                 made.push((slot, first * 32));
@@ -3123,7 +3168,7 @@ impl State {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
-                            readable(list, kind, &view);
+                            self.readable_marked(list, kind, &view);
                         }
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it

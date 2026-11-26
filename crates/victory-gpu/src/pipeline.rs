@@ -122,6 +122,15 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            // Every container the title makes, translated or not ([`code_index`]).
+            #[cfg(all(windows, feature = "diagnostics"))]
+            if code_index::on()
+                && let Ok(c) = victory_shader::Container::parse(bytes)
+                && let Some(part) = c.part(victory_shader::FourCC::DXIL)
+                && let Ok(programs) = victory_shader::native_programs(part.data)
+            {
+                code_index::add(bytes, &programs);
+            }
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
@@ -197,6 +206,70 @@ impl Shader {
     }
 }
 
+/// Diagnostics (`VICTORY_CODE_INDEX=1`): every native program the title's
+/// containers hold, by a hash of its GFX10 code, whole and by its first 64
+/// bytes, with the container's hash (as "shader translated" logs it) and
+/// the program's stage: so that code met elsewhere (the descriptions of the
+/// two device methods not implemented, `device.rs`) can be told to be a
+/// program already translated.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) mod code_index {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    type Found = (String, String);
+    static WHOLE: Mutex<Option<HashMap<[u8; 16], Found>>> = Mutex::new(None);
+    static PREFIX: Mutex<Option<HashMap<[u8; 16], Found>>> = Mutex::new(None);
+
+    pub(crate) fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_CODE_INDEX").is_some_and(|v| v == "1"))
+    }
+
+    fn key(bytes: &[u8]) -> [u8; 16] {
+        let mut k = [0u8; 16];
+        k.copy_from_slice(&blake3::hash(bytes).as_bytes()[..16]);
+        k
+    }
+
+    pub(crate) fn add(container: &[u8], programs: &[victory_shader::NativeProgram]) {
+        if !on() || programs.is_empty() {
+            return;
+        }
+        let shader = blake3::hash(container).to_hex()[..16].to_owned();
+        let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut prefix = PREFIX.lock().unwrap_or_else(|e| e.into_inner());
+        for p in programs {
+            let found = (shader.clone(), format!("{:?}", p.stage));
+            whole.get_or_insert_with(HashMap::new).insert(key(&p.code), found.clone());
+            if p.code.len() >= 64 {
+                prefix.get_or_insert_with(HashMap::new).insert(key(&p.code[..64]), found);
+            }
+        }
+    }
+
+    /// What `blob` is among the indexed programs: its whole bytes, or 64
+    /// bytes from a 4-byte step up to 256 bytes in (a header before the
+    /// code), and how many programs are indexed.
+    pub(crate) fn look(blob: &[u8]) -> (Option<(Found, &'static str, usize)>, usize) {
+        let whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
+        let prefix = PREFIX.lock().unwrap_or_else(|e| e.into_inner());
+        let count = whole.as_ref().map_or(0, HashMap::len);
+        if let Some(f) = whole.as_ref().and_then(|w| w.get(&key(blob))) {
+            return (Some((f.clone(), "whole", 0)), count);
+        }
+        for at in (0..=256usize).step_by(4) {
+            if at + 64 > blob.len() {
+                break;
+            }
+            if let Some(f) = prefix.as_ref().and_then(|p| p.get(&key(&blob[at..at + 64]))) {
+                return (Some((f.clone(), "first 64 bytes", at)), count);
+            }
+        }
+        (None, count)
+    }
+}
+
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
@@ -207,6 +280,8 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
+    #[cfg(feature = "diagnostics")]
+    code_index::add(container, &programs);
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
     let used = programs

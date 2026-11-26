@@ -346,6 +346,87 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
+/// Diagnostics of [`unknown_pipeline`]: each `(pointer, size)` pair of the
+/// description's first 32 words that reads as a blob (a pointer the kernel
+/// can read, 16 bytes to 1 MiB) is hashed as `crate::pipeline` hashes a
+/// shader's bytes (blake3, 16 hex digits), and each hash is logged the
+/// first time it is seen (the first 4,096), with the slot, the pair's
+/// place, the size and the blob's first four bytes; so that they can be looked up among the
+/// "shader translated" lines (their stages). With it, at powers of two, the
+/// count of distinct descriptions (their 32 words) per slot.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn unknown_pipeline_blobs(slot: usize, desc: usize) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<(HashSet<[u8; 32]>, HashSet<Vec<u64>>, [u32; 2])>> = Mutex::new(None);
+    let mut bytes = [0u8; 256];
+    if desc == 0 || !crate::host::read_into(desc as *const u8, &mut bytes) {
+        return;
+    }
+    let words: Vec<u64> = bytes.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c)).collect();
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let (blobs, descriptions, distinct) = seen.get_or_insert_with(|| (HashSet::new(), HashSet::new(), [0, 0]));
+    let which = usize::from(slot == 0x218);
+    if descriptions.insert(words.clone()) {
+        distinct[which] += 1;
+        if distinct[which].is_power_of_two() {
+            tracing::info!(slot = format_args!("{slot:#x}"), distinct = distinct[which], "unknown pipeline method: distinct descriptions so far");
+        }
+    }
+    for i in 0..words.len() - 1 {
+        let (at, size) = (words[i] as usize, words[i + 1] as usize);
+        if at < 0x1_0000 || !(16..=1 << 20).contains(&size) {
+            continue;
+        }
+        let mut blob = vec![0u8; size];
+        if !crate::host::read_into(at as *const u8, &mut blob) {
+            continue;
+        }
+        let full = blake3::hash(&blob);
+        // (At most 4,096 logged: the run's log stays readable.)
+        if blobs.len() < 4096 && blobs.insert(*full.as_bytes()) {
+            let magic: String = blob[..4].iter().map(|&b| if b.is_ascii_graphic() { b as char } else { '.' }).collect();
+            // With `VICTORY_CODE_INDEX=1`: the blob among the native programs of
+            // the title's containers (`pipeline::code_index`).
+            let (found, indexed) = if crate::pipeline::code_index::on() {
+                crate::pipeline::code_index::look(&blob)
+            } else {
+                (None, 0)
+            };
+            let matched = found
+                .map(|((shader, stage), how, at)| format!("{stage} of shader {shader} ({how}, at byte {at})"))
+                .unwrap_or_else(|| "none".to_owned());
+            tracing::info!(
+                slot = format_args!("{slot:#x}"),
+                word = i,
+                size,
+                hash = &full.to_hex()[..16],
+                magic,
+                indexed,
+                matched,
+                "unknown pipeline method: a blob in its description"
+            );
+        }
+        // `VICTORY_DUMP_UNKNOWN_PIPELINES=<dir>`: the first 32 descriptions
+        // of each slot written as they are, words and blobs, for study.
+        if let Some(dir) = dump_dir() {
+            let n = distinct[which];
+            if n <= 32 {
+                let base = dir.join(format!("{slot:x}-{n:02}"));
+                let _ = std::fs::create_dir_all(&base);
+                let _ = std::fs::write(base.join("words.bin"), bytes);
+                let _ = std::fs::write(base.join(format!("w{i:02}-{size}.bin")), &blob);
+            }
+        }
+    }
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn dump_dir() -> Option<&'static std::path::Path> {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| std::env::var_os("VICTORY_DUMP_UNKNOWN_PIPELINES").map(std::path::PathBuf::from)).as_deref()
+}
+
 /// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
 /// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
 /// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
@@ -369,6 +450,8 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    unknown_pipeline_blobs(SLOT, desc as usize);
     if calls <= 4 || calls.is_power_of_two() {
         // Sixteen 64-bit words at `at`, read through the kernel: neither
         // pointer is known to be mapped.

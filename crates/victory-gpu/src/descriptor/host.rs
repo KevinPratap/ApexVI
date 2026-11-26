@@ -131,6 +131,38 @@ pub(crate) fn first_viewed(start: u64) -> Option<u32> {
 /// them ([`HostHeap::texture_views_remade`]).
 static RESHOWN: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
+/// `VICTORY_TEXTURE_MIP_DROP_UI_FULL=2`: where the placed textures start
+/// whose host copies were taken out to be made whole
+/// (`crate::resource::want_whole`): their slots are made again, and due,
+/// at the next texture pass ([`HostHeap::texture_views_rewhole`]).
+static REWHOLE: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// A texture view `view` is read by a draw into a presented image
+/// (`VICTORY_TEXTURE_MIP_DROP_UI_FULL=2`): its texture is kept whole, and
+/// made again so if its host copy left levels off.
+#[cfg(windows)]
+pub(crate) fn mark_whole(view: &View) {
+    if crate::resource::mip_drop_ui_level() < 2 {
+        return;
+    }
+    match view {
+        View::Placed(false, resource, desc) if resource[0] != 1 => {
+            let start = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            if let Some(View::Shader(texture, _)) = placed_texture(view)
+                && crate::resource::want_whole(texture as crate::object::This)
+            {
+                REWHOLE.lock().unwrap_or_else(|e| e.into_inner()).push(start);
+            }
+        }
+        View::Shader(texture, _) if crate::resource::buffer_bytes(*texture as crate::object::This).is_none() => {
+            // (A texture object: its slots are keyed by record, made again
+            // by the draws that read it through tables.)
+            let _ = crate::resource::want_whole(*texture as crate::object::This);
+        }
+        _ => {}
+    }
+}
+
 /// The first level with memory of the placed texture at `start` changed:
 /// its slots are made again at the next texture pass.
 pub(crate) fn levels_changed(start: u64) {
@@ -1431,6 +1463,44 @@ impl HostHeap {
         remade
     }
 
+    /// [`mark_whole`]: the slots of the placed textures made whole are made
+    /// again from their new host copies and are due in the queue of textures
+    /// picked by index (the new copy is uploaded there). Returns how many.
+    pub(crate) fn texture_views_rewhole(&self, frame: u64) -> usize {
+        if self.sampler {
+            return 0;
+        }
+        let starts = std::mem::take(&mut *REWHOLE.lock().unwrap_or_else(|e| e.into_inner()));
+        if starts.is_empty() {
+            return 0;
+        }
+        let slots: Vec<u32> = {
+            let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            starts.iter().flat_map(|&start| placed.slots_at(start)).collect()
+        };
+        let mut remade = 0;
+        {
+            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            for &slot in &slots {
+                let Some(&key) = made.get(slot as usize) else {
+                    continue;
+                };
+                let Some(view) = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten() else {
+                    continue;
+                };
+                if let Some(kept) = make(&view, self.cpu(slot)) {
+                    self.keep(slot, kept);
+                    remade += 1;
+                }
+            }
+        }
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        for slot in slots {
+            textures.written(slot, frame, 0, false);
+        }
+        remade
+    }
+
     /// The memory of the texture title slot `index` views is not mapped
     /// (any more): a host slot made from it becomes null again, so that
     /// the host copy can be let go (`crate::resource::let_go_idle`; a slot
@@ -2048,11 +2118,23 @@ impl HostHeap {
             // time it got sharper.
             if later
                 && keep_views()
-                && view_at(made[index as usize] as u32, (made[index as usize] >> 32) as u32)
-                    .is_some_and(|old| same_placed_texture(&old, &view))
+                && let Some(old) = view_at(made[index as usize] as u32, (made[index as usize] >> 32) as u32)
             {
-                KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Some(view);
+                if same_placed_texture(&old, &view) {
+                    KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Some(view);
+                }
+                // And of another texture that can stand for it until the
+                // new one is made ([`keep_shown`]): made null, the slot
+                // read as black for as long as it waited.
+                if keep_shown() > 0 && is_texture_view(&old) {
+                    let kin = kin(&old, &view);
+                    let kept = kin.kept(keep_shown());
+                    rewritten(kin, kept);
+                    if kept {
+                        return Some(view);
+                    }
+                }
             }
             made[index as usize] = if later { 0 } else { key };
             // Not seen as made by the lock-free check until it is.
@@ -2069,6 +2151,31 @@ impl HostHeap {
             self.made_fast[index as usize].store(made[index as usize], std::sync::atomic::Ordering::Release);
         }
         Some(view)
+    }
+
+    /// Whether slot `index` is made from the record the title slot at
+    /// `handle` holds now ([`show_after`]).
+    pub(crate) fn made_from(&self, index: u32, handle: u64) -> bool {
+        let key = record_key(handle);
+        key != 0 && self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize) == Some(&key)
+    }
+
+    /// [`show_after`]: slot `index`, written with the record at `handle`, is
+    /// made once the submission `list` goes out in has finished (the list
+    /// uploads its texture); until then it shows what it showed.
+    pub(crate) fn flip_after(&self, list: &crate::host::HostList, handle: u64) {
+        let key = record_key(handle);
+        if key == 0 {
+            return;
+        }
+        let asked = crate::frame::current();
+        FLIPPED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Run as the list's submission is prepared: its number is the one
+        // that has started.
+        list.defer_host(move || {
+            let after = crate::host::submissions_started();
+            FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push((after, handle, key, asked));
+        });
     }
 
     // the slot's host descriptor is made again at the next mirror (its copy left the tables)
@@ -3021,6 +3128,145 @@ fn keep_views() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_VIEWS").is_none_or(|v| v != "0"))
 }
 
+/// What the texture view a slot is written with has to do with the one it
+/// shows (after avatarmanz/VIctory-7900XTX, `Kin`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kin {
+    /// A texture of the same description placed elsewhere (moved, or one of
+    /// its kind).
+    Moved,
+    /// One of the same format and shape in another size: the same texture
+    /// with more or fewer levels, as a title streams it.
+    Sized,
+    /// A view of the same dimension, of another texture.
+    Other,
+    /// A view no shader that reads the one can read.
+    None,
+}
+
+impl Kin {
+    /// Whether the slot goes on showing what it shows, by [`keep_shown`].
+    fn kept(self, keep: u8) -> bool {
+        match self {
+            Kin::Moved | Kin::Sized => keep >= 1,
+            Kin::Other => keep >= 2,
+            Kin::None => false,
+        }
+    }
+
+    fn number(self) -> usize {
+        match self {
+            Kin::Moved => 0,
+            Kin::Sized => 1,
+            Kin::Other => 2,
+            Kin::None => 3,
+        }
+    }
+}
+
+/// [`Kin`] of the view `old`, which a slot shows, and `new`, another
+/// texture's (the same placed texture is [`same_placed_texture`]).
+fn kin(old: &View, new: &View) -> Kin {
+    if let (View::Placed(false, a, from), View::Placed(false, b, to)) = (old, new) {
+        if a[0] == 1 || b[0] == 1 || from[1] != to[1] {
+            return Kin::None;
+        }
+        // (Width, 64 bits, height, depth and levels, format: words 4 to 8.)
+        if a[0] == b[0] && a[2..13] == b[2..13] {
+            return Kin::Moved;
+        }
+        let (wide, high) = ([a[4], b[4]].map(u64::from), [a[6], b[6]].map(u64::from));
+        return if from[0] == to[0] && a[0] == b[0] && wide[0] * high[1] == wide[1] * high[0] {
+            Kin::Sized
+        } else {
+            Kin::Other
+        };
+    }
+    let dimension = |view: &View| match view {
+        View::Placed(false, resource, desc) if resource[0] != 1 => desc[1],
+        View::Shader(r, Some(desc)) if crate::resource::buffer_bytes(*r as crate::object::This).is_none() => desc[1],
+        _ => 0,
+    };
+    match (dimension(old), dimension(new)) {
+        (0, _) | (_, 0) => Kin::None,
+        (a, b) if a == b => Kin::Other,
+        _ => Kin::None,
+    }
+}
+
+/// Whether a slot of the textures picked by index that is written with a
+/// new view shows it only once the submission that uploads its texture has
+/// finished (`VICTORY_SHOW_AFTER=1`; off by default: made at once, as
+/// before). After avatarmanz/VIctory-7900XTX (`VICTORY_SHOW_AFTER`,
+/// `texture_slot_flip`): "Shown at once, the lists already on the card read
+/// it by index while it is made". Here the texture pass (`crate::draw`)
+/// made the slot at once and only recorded the upload in a list that ran
+/// later, so the frames already on the card (two ahead) read the new host
+/// texture empty: the title's loading art went black for two or three
+/// frames at a time. With the switch the slot goes on showing what it
+/// showed until the upload has run ([`texture_flips`]).
+pub(crate) fn show_after() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHOW_AFTER").is_some_and(|v| v == "1"))
+}
+
+/// The key of the record the title slot at `handle` holds now (as
+/// [`HostHeap::mirror`] keys a made slot); 0 if it holds no view of ours.
+pub(crate) fn record_key(handle: u64) -> u64 {
+    // SAFETY: the handle is a descriptor slot in title memory.
+    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    if tag == VIEW_TAG { u64::from(generation) << 32 | u64::from(i) } else { 0 }
+}
+
+/// [`show_after`]: slots to make once a submission has finished, as
+/// (submission, title slot handle, record key, frame asked).
+pub(crate) static FLIPS: Mutex<Vec<(u64, u64, u64, u64)>> = Mutex::new(Vec::new());
+
+/// [`show_after`], since the start: flips queued, made, dropped (the slot
+/// was written again, or went), the frames they waited in all, the most.
+pub(crate) static FLIPPED: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Whether a slot that is written with a view of another texture, one that
+/// has to wait for its host copy, goes on showing the texture it shows until
+/// the new one is made and uploaded (`VICTORY_KEEP_SHOWN`; unset or 0: no,
+/// it is made null at once and reads as zeros, as before; 1: when the new
+/// one is of the same kind in another place or size; 2: any of the same
+/// dimension). After avatarmanz/VIctory-7900XTX (`VICTORY_KEEP_SHOWN`, 1 by
+/// default there): "black, then grey for a frame or two is what popped".
+/// Here the whole screen of the title's loading art went black for two or
+/// three frames at a time (run flickB: the presented image itself black,
+/// one draw that frame, 66 textures picked by index waiting for their
+/// memory).
+fn keep_shown() -> u8 {
+    static KEEP: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *KEEP.get_or_init(|| std::env::var("VICTORY_KEEP_SHOWN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0).min(2))
+}
+
+/// With [`keep_shown`]: slots that showed a texture and were written with a
+/// view of another that waits, since the start, by [`Kin`] (moved, sized,
+/// other, none), and those of them that kept what they showed.
+static REWRITTEN: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Counts a slot [`REWRITTEN`] and logs the counts at powers of two.
+fn rewritten(kin: Kin, kept: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    REWRITTEN[kin.number()].fetch_add(1, Relaxed);
+    REWRITTEN[4].fetch_add(u64::from(kept), Relaxed);
+    let n: u64 = REWRITTEN[..4].iter().map(|n| n.load(Relaxed)).sum();
+    if n.is_power_of_two() {
+        tracing::info!(
+            "slots written with another texture that waits, since the start (VICTORY_KEEP_SHOWN={}): {} moved, {} sized, {} other, \
+             {} none; {} kept what they showed",
+            keep_shown(),
+            REWRITTEN[0].load(Relaxed),
+            REWRITTEN[1].load(Relaxed),
+            REWRITTEN[2].load(Relaxed),
+            REWRITTEN[3].load(Relaxed),
+            REWRITTEN[4].load(Relaxed)
+        );
+    }
+}
+
 /// Whether both are shader views of one texture the title placed in
 /// memory: the same address and the same resource description, whatever
 /// part of it each shows.
@@ -3219,6 +3465,68 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// VICTORY_SHOW_AFTER: a title slot's record key as `mirror` keys it,
+    /// none for a slot without a view of ours; a flip waits for its
+    /// submission, and one whose slot no longer holds its record (or whose
+    /// heap is gone) is dropped, not made.
+    #[test]
+    fn flips_wait_for_their_submission_and_drop_when_rewritten() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let record = [VIEW_TAG, 7u32, 3u32];
+        let handle = record.as_ptr() as u64;
+        assert_eq!(record_key(handle), 3u64 << 32 | 7);
+        let other = [VIEW_TAG ^ 1, 7u32, 3u32];
+        assert_eq!(record_key(other.as_ptr() as u64), 0, "no view of ours");
+        let dropped = FLIPPED[2].load(Relaxed);
+        FLIPS.lock().unwrap().push((50_000_000, handle, record_key(handle), 0));
+        assert_eq!(crate::descriptor::texture_flips(49_999_999), 0);
+        assert!(FLIPS.lock().unwrap().iter().any(|f| f.1 == handle), "not due: it waits");
+        // Due, but in no registered heap (as a heap that went): dropped.
+        assert_eq!(crate::descriptor::texture_flips(50_000_000), 0);
+        assert!(!FLIPS.lock().unwrap().iter().any(|f| f.1 == handle), "taken off");
+        assert!(FLIPPED[2].load(Relaxed) > dropped, "counted dropped");
+        // Written again before it was due: dropped too.
+        FLIPS.lock().unwrap().push((50_000_001, handle, 99, 0));
+        assert_eq!(crate::descriptor::texture_flips(50_000_001), 0);
+        assert!(!FLIPS.lock().unwrap().iter().any(|f| f.1 == handle));
+    }
+
+    /// VICTORY_KEEP_SHOWN: a placed texture of the same description is
+    /// "moved", the same texture streamed at another size "sized", another
+    /// shape "other", another dimension "none"; 1 keeps moved and sized,
+    /// 2 also other.
+    #[test]
+    fn kinds_of_rewritten_texture_views() {
+        use super::{Kin, View, kin};
+        let texture = |width: u32, height: u32, levels: u32| {
+            let mut r = [0u32; 14];
+            r[0] = 3; // a 2D texture, not a buffer (1)
+            r[4] = width;
+            r[6] = height;
+            r[7] = levels;
+            r[8] = 71; // a format
+            r
+        };
+        let view = |r: [u32; 14], dimension: u32, at: u32| {
+            let mut d = [0u32; 16];
+            d[0] = 71;
+            d[1] = dimension;
+            d[10] = at;
+            View::Placed(false, r, d)
+        };
+        let old = view(texture(1024, 512, 11), 4, 0x100);
+        assert_eq!(kin(&old, &view(texture(1024, 512, 11), 4, 0x900)), Kin::Moved);
+        assert_eq!(kin(&old, &view(texture(256, 128, 9), 4, 0x900)), Kin::Sized);
+        assert_eq!(kin(&old, &view(texture(256, 256, 9), 4, 0x900)), Kin::Other);
+        assert_eq!(kin(&old, &view(texture(1024, 512, 11), 7, 0x900)), Kin::None, "another dimension");
+        let mut buffer = texture(1024, 512, 11);
+        buffer[0] = 1;
+        assert_eq!(kin(&old, &view(buffer, 4, 0x900)), Kin::None, "a buffer");
+        assert!(Kin::Moved.kept(1) && Kin::Sized.kept(1) && !Kin::Other.kept(1) && !Kin::None.kept(1));
+        assert!(Kin::Other.kept(2) && !Kin::None.kept(2));
+        assert!(!Kin::Moved.kept(0), "off keeps nothing");
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.

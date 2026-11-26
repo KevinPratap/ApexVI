@@ -1258,6 +1258,45 @@ pub(crate) struct Plane {
 }
 const _: () = assert!(std::mem::size_of::<Plane>() == 0x48);
 
+/// How the planes of presents come, for telling a UI that blinks because a
+/// title leaves its UI plane out of some presents (as a console's display
+/// keeps a plane it was not handed again) from one it draws every frame:
+/// every 256 presents, how many came with 0, 1, 2 and 3+ planes that hold a
+/// resource, how many planes the title passed, and how often the count
+/// changed from one present to the next, with the last 32 counts.
+#[cfg(windows)]
+fn plane_census(passed: u32, shown: usize) {
+    use std::sync::atomic::AtomicU8;
+    static BY: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    static PASSED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    static CHANGES: AtomicU64 = AtomicU64::new(0);
+    static LAST: AtomicU8 = AtomicU8::new(u8::MAX);
+    static RECENT: std::sync::Mutex<std::collections::VecDeque<u8>> = std::sync::Mutex::new(std::collections::VecDeque::new());
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    let n = shown.min(3) as u8;
+    BY[n as usize].fetch_add(1, Ordering::Relaxed);
+    PASSED[(passed as usize).min(3)].fetch_add(1, Ordering::Relaxed);
+    if LAST.swap(n, Ordering::Relaxed) != n {
+        CHANGES.fetch_add(1, Ordering::Relaxed);
+    }
+    {
+        let mut recent = RECENT.lock().unwrap_or_else(|e| e.into_inner());
+        recent.push_back(n);
+        if recent.len() > 32 {
+            recent.pop_front();
+        }
+    }
+    if (SEEN.fetch_add(1, Ordering::Relaxed) + 1).is_multiple_of(256) {
+        let by: Vec<u64> = BY.iter().map(|c| c.swap(0, Ordering::Relaxed)).collect();
+        let passed: Vec<u64> = PASSED.iter().map(|c| c.swap(0, Ordering::Relaxed)).collect();
+        let recent: String = RECENT.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|n| char::from(b'0' + n)).collect();
+        tracing::info!(
+            "planes of the last 256 presents: with a resource 0/1/2/3+ {by:?}, passed by the title 0/1/2/3+ {passed:?}; the count changed {} times; the last 32: {recent}",
+            CHANGES.swap(0, Ordering::Relaxed)
+        );
+    }
+}
+
 /// The first resource of every plane the title presents (at most 8), in
 /// plane order: the scene first, then overlays such as a Series S title's
 /// UI plane.
@@ -1473,6 +1512,8 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     let shown = plane_resources(planes, plane_parameters);
     #[cfg(windows)]
     let several = shown.len() > 1;
+    #[cfg(windows)]
+    plane_census(planes, shown.len());
     #[cfg(windows)]
     let later = !several && crate::present_later::on() && behind() && crate::host::late_free_present();
     // With `present_behind` (and not `later`): the frame is shown by our

@@ -177,6 +177,73 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
     }
 }
 
+/// The host textures presented lately (the scene and its planes), the last
+/// sixteen distinct ones (`VICTORY_TEXTURE_MIP_DROP_UI_FULL=2`).
+static PRESENTED: std::sync::Mutex<std::collections::VecDeque<usize>> = std::sync::Mutex::new(std::collections::VecDeque::new());
+
+fn note_presented(texture: usize) {
+    let mut presented = PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
+    if !presented.contains(&texture) {
+        if presented.len() >= 16 {
+            presented.pop_front();
+        }
+        presented.push_back(texture);
+    }
+}
+
+/// Whether host texture `texture` (its COM pointer) was presented lately.
+pub(crate) fn presented_lately(texture: usize) -> bool {
+    PRESENTED.lock().unwrap_or_else(|e| e.into_inner()).contains(&texture)
+}
+
+/// The number of the last submission that started (for work deferred into
+/// it, as `descriptor::host::show_after`'s).
+pub(crate) fn submissions_started() -> u64 {
+    STARTED.load(Ordering::Acquire)
+}
+
+/// How much of a submission's preparation runs beside its other parts
+/// (`VICTORY_PREP_SPLIT`; 0, unset: none, as before). Steps of
+/// docs/prep-split-plan.md. 1 (A1): the records the title copied into its
+/// shader-visible heaps (`crate::descriptor::sync_heaps`, 13 ms a frame of
+/// the submitting thread in run batch36) are mirrored on a kept thread
+/// while the submission's copies are asked about, merged and refreshed,
+/// and joined before its snapshots and its lists go to the card.
+///
+/// What it keeps: the heaps' slots are made before any list that indexes
+/// them is sent (the join comes before `take_snapshots`, `card_before` and
+/// `ExecuteCommandLists`, on every path of `Host::submit`, none of which
+/// returns between the start and the join); the slots that waited for a
+/// texture's host copy are made after the heap's records, as before
+/// (`make_waiting` moves to the join); the sweep, which lets go of host
+/// copies no slot keeps, never runs beside the mirroring, nor before it in
+/// a submission (when a sweep is due the mirroring is done in place, as
+/// before). The mirroring takes none of the locks the submitting thread
+/// holds while it waits for the join (`submitted` above all: the
+/// descriptor code never settles, executes or submits).
+pub(crate) fn prep_split() -> u8 {
+    static LEVEL: OnceLock<u8> = OnceLock::new();
+    *LEVEL.get_or_init(|| std::env::var("VICTORY_PREP_SPLIT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// With [`prep_split`]: microseconds the submitting thread waited at the
+/// join for the heaps' mirroring, since the start (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) static HEAPS_JOINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether [`sweep`] would let go of something if called now (its second
+/// is up and it is not turned off).
+fn sweep_due() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_SWEEP").is_none_or(|v| v != "0")) {
+        return false;
+    }
+    now_ms() >= SWEPT_LAST.load(Ordering::Relaxed) + 1000
+}
+
+/// [`sweep`]'s last time.
+static SWEPT_LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Once a second, before a submission starts: lets go of what nothing
 /// names any more (copies of windows of title memory, staging buffers,
 /// host copies of textures the title fills).
@@ -188,11 +255,10 @@ fn sweep() {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_SWEEP").is_none_or(|v| v != "0")) {
         return;
     }
-    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = now_ms();
-    let last = LAST.load(Ordering::Relaxed);
+    let last = SWEPT_LAST.load(Ordering::Relaxed);
     if now < last + 1000
-        || LAST
+        || SWEPT_LAST
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
     {
@@ -5771,9 +5837,21 @@ impl Host {
                 self.settle(&mut submitted, why);
             }
         }
+        // Slots of textures picked by index whose upload has run since they
+        // were written (`show_after`): made now, before lists read them.
+        if crate::descriptor::host::show_after() {
+            crate::descriptor::texture_flips(FINISHED.load(Ordering::Acquire));
+        }
         // Descriptors the title copied into placed heaps directly, before
-        // command lists that index those slots are submitted.
-        crate::descriptor::sync_heaps();
+        // command lists that index those slots are submitted: beside the
+        // copies' preparing with `prep_split` (joined below), in place when
+        // a sweep is due (it must not run beside or before the mirroring).
+        let heaps = if prep_split() >= 1 && !sweep_due() {
+            Some(crate::shadow::wide_start(Box::new(crate::descriptor::sync_heaps)))
+        } else {
+            crate::descriptor::sync_heaps();
+            None
+        };
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
@@ -5792,8 +5870,11 @@ impl Host {
         }
         let behind = late && flying();
         // The slots that waited for a texture's host copy, before the
-        // lists that may read them run.
-        crate::descriptor::make_waiting();
+        // lists that may read them run (after the heaps' records: at the
+        // join below when they are mirrored beside).
+        if heaps.is_none() {
+            crate::descriptor::make_waiting();
+        }
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
@@ -5868,6 +5949,16 @@ impl Host {
         }
         batch.flush();
         crate::watch::ask_once_end();
+        // The heaps' records mirrored beside: done before anything below
+        // can send a list that indexes them.
+        if let Some(heaps) = heaps {
+            #[cfg(feature = "diagnostics")]
+            let joining = std::time::Instant::now();
+            heaps.join();
+            #[cfg(feature = "diagnostics")]
+            HEAPS_JOINED.fetch_add(joining.elapsed().as_micros() as u64, Ordering::Relaxed);
+            crate::descriptor::make_waiting();
+        }
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
@@ -8263,6 +8354,16 @@ impl Meter {
         crate::watch::absent_line(frames);
         crate::watch::rest_line(frames);
         crate::watch::bits_line(frames);
+        #[cfg(feature = "diagnostics")]
+        if prep_split() >= 1 {
+            static WAS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let now = HEAPS_JOINED.load(Ordering::Relaxed);
+            let waited = now.saturating_sub(WAS.swap(now, Ordering::Relaxed)) as f64 / 1000.0 / frames;
+            tracing::info!(
+                "preparing split (VICTORY_PREP_SPLIT={}): {waited:.2} ms a frame waited at the join for the heaps' mirroring",
+                prep_split()
+            );
+        }
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
@@ -8590,6 +8691,12 @@ impl Host {
         overlays: &[(&ID3D12Resource, u32)],
         frame: u64,
     ) -> Option<bool> {
+        if crate::resource::mip_drop_ui_level() >= 2 {
+            note_presented(texture.as_raw() as usize);
+            for (overlay, _) in overlays {
+                note_presented(overlay.as_raw() as usize);
+            }
+        }
         let showing = std::time::Instant::now();
         let shown = self.present_now(texture, state, overlays, frame);
         crate::framelog::add(crate::framelog::T::PresentShowUs, showing.elapsed().as_micros() as u64);
