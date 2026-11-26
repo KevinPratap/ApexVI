@@ -80,6 +80,19 @@ fn jitter(index: i32, phases: i32) -> (f32, f32) {
     (halton(i, 2) - 0.5, halton(i, 3) - 0.5)
 }
 
+fn spatial_no_jitter() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_SPATIAL_NO_JITTER")
+            .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+        if on {
+            tracing::info!("spatial upscaler queries report 1 phase and zero jitter (VICTORY_SPATIAL_NO_JITTER=1)");
+        }
+        on
+    }) && victory_gpu::upscale::chosen() == "spatial"
+}
+
 pub(crate) fn create(context: *mut *mut c_void, desc: *const c_void) -> u32 {
     if context.is_null() {
         return PARAMETER;
@@ -125,9 +138,12 @@ pub(crate) fn query(desc: *const c_void) -> u32 {
                 write(read::<*mut u32>(d, 32), (read::<u32>(d, 16) as f32 / r) as u32);
                 write(read::<*mut u32>(d, 40), (read::<u32>(d, 20) as f32 / r) as u32);
             }
-            QUERY_PHASE_COUNT => write(read::<*mut i32>(d, 24), phase_count(read(d, 16), read(d, 20))),
+            QUERY_PHASE_COUNT => {
+                let n = if spatial_no_jitter() { 1 } else { phase_count(read(d, 16), read(d, 20)) };
+                write(read::<*mut i32>(d, 24), n);
+            }
             QUERY_JITTER => {
-                let (x, y) = jitter(read(d, 16), read(d, 20));
+                let (x, y) = if spatial_no_jitter() { (0.0, 0.0) } else { jitter(read(d, 16), read(d, 20)) };
                 write(read::<*mut f32>(d, 24), x);
                 write(read::<*mut f32>(d, 32), y);
             }
