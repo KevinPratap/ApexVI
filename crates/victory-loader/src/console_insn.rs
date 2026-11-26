@@ -125,6 +125,24 @@ fn wait_ended(begin: u64, last: u64, address: usize, wanted: u64, spins: u32) {
     }
 }
 
+/// Whether an emulated `mwaitx` of a wait that has gone on for [`YIELD_AFTER`] of them
+/// gives the processor to a thread that is ready (`SwitchToThread`) before the title looks
+/// at its value again (`VICTORY_MWAITX_YIELD=1`; off by default). The title waits for fences
+/// in `monitorx` / `mwaitx` loops, two exceptions a turn, and the emulated `mwaitx` returned
+/// at once: run batch19 took 38,600 of each a second, the waiting threads spinning flat out
+/// beside the ones recording and submitting. The title's loop looks at the value itself, so
+/// nothing but the rate changes; with no thread ready the call returns at once.
+fn mwaitx_yield() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MWAITX_YIELD").is_some_and(|v| v == "1"))
+}
+
+/// `mwaitx` of one wait before [`mwaitx_yield`] yields at each.
+const YIELD_AFTER: u32 = 64;
+
+/// Yields made by [`mwaitx_yield`] since the last line.
+static YIELDED: AtomicU64 = AtomicU64::new(0);
+
 /// A `mwaitx` of this thread: part of the wait under way, or the first of a new one.
 fn wait_step() {
     let now = clock_us();
@@ -153,6 +171,10 @@ fn line() {
     let seconds = (now - last) as f64 / 1e3;
     let k: Vec<f64> = KINDS.iter().map(|k| k.swap(0, Relaxed) as f64 / seconds).collect();
     let w: Vec<f64> = WAITS.iter().map(|w| w.swap(0, Relaxed) as f64).collect();
+    let yielded = YIELDED.swap(0, Relaxed) as f64 / seconds;
+    if yielded > 0.0 {
+        tracing::info!("emulated mwaitx that gave the processor away, a second (VICTORY_MWAITX_YIELD=1): {yielded:.0}");
+    }
     tracing::info!(
         "console CPU instructions, exceptions a second: clzero alone {:.0}, its 12-byte loop {:.0}, its 15-byte loop taken whole {:.0} ({:.0} lines a second, each an exception \
          before; VICTORY_CLZERO_LOOP15=0: again), monitorx {:.0}, mwaitx {:.0}, others {:.0} | mwaitx waits ended a second: {:.0}, {:.1} ms of thread time a second; of 1 ms and \
@@ -372,7 +394,15 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
         ConsoleOnly::Mwaitx => {
             KINDS[K_MWAITX].fetch_add(1, Relaxed);
             wait_step();
-            std::hint::spin_loop()
+            // A wait that goes on (`mwaitx_yield`): the processor to whoever
+            // is ready, if anyone is; back at once if nobody is.
+            if mwaitx_yield() && WAIT.with(Cell::get).4 >= YIELD_AFTER {
+                // SAFETY: no preconditions.
+                unsafe { windows_sys::Win32::System::Threading::SwitchToThread() };
+                YIELDED.fetch_add(1, Relaxed);
+            } else {
+                std::hint::spin_loop()
+            }
         }
         ConsoleOnly::Clzero | ConsoleOnly::ClzeroStep { .. } => {
             // The loop `mov rax, ptr; add ptr, 0x40; clzero; cmp ptr, end; jb` (the title's
