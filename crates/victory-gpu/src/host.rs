@@ -177,6 +177,25 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
     }
 }
 
+/// The host textures presented lately (the scene and its planes), the last
+/// sixteen distinct ones (`VICTORY_TEXTURE_MIP_DROP_UI_FULL=2`).
+static PRESENTED: std::sync::Mutex<std::collections::VecDeque<usize>> = std::sync::Mutex::new(std::collections::VecDeque::new());
+
+fn note_presented(texture: usize) {
+    let mut presented = PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
+    if !presented.contains(&texture) {
+        if presented.len() >= 16 {
+            presented.pop_front();
+        }
+        presented.push_back(texture);
+    }
+}
+
+/// Whether host texture `texture` (its COM pointer) was presented lately.
+pub(crate) fn presented_lately(texture: usize) -> bool {
+    PRESENTED.lock().unwrap_or_else(|e| e.into_inner()).contains(&texture)
+}
+
 /// The number of the last submission that started (for work deferred into
 /// it, as `descriptor::host::show_after`'s).
 pub(crate) fn submissions_started() -> u64 {
@@ -8672,6 +8691,12 @@ impl Host {
         overlays: &[(&ID3D12Resource, u32)],
         frame: u64,
     ) -> Option<bool> {
+        if crate::resource::mip_drop_ui_level() >= 2 {
+            note_presented(texture.as_raw() as usize);
+            for (overlay, _) in overlays {
+                note_presented(overlay.as_raw() as usize);
+            }
+        }
         let showing = std::time::Instant::now();
         let shown = self.present_now(texture, state, overlays, frame);
         crate::framelog::add(crate::framelog::T::PresentShowUs, showing.elapsed().as_micros() as u64);

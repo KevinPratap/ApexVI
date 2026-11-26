@@ -131,6 +131,38 @@ pub(crate) fn first_viewed(start: u64) -> Option<u32> {
 /// them ([`HostHeap::texture_views_remade`]).
 static RESHOWN: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
+/// `VICTORY_TEXTURE_MIP_DROP_UI_FULL=2`: where the placed textures start
+/// whose host copies were taken out to be made whole
+/// (`crate::resource::want_whole`): their slots are made again, and due,
+/// at the next texture pass ([`HostHeap::texture_views_rewhole`]).
+static REWHOLE: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// A texture view `view` is read by a draw into a presented image
+/// (`VICTORY_TEXTURE_MIP_DROP_UI_FULL=2`): its texture is kept whole, and
+/// made again so if its host copy left levels off.
+#[cfg(windows)]
+pub(crate) fn mark_whole(view: &View) {
+    if crate::resource::mip_drop_ui_level() < 2 {
+        return;
+    }
+    match view {
+        View::Placed(false, resource, desc) if resource[0] != 1 => {
+            let start = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            if let Some(View::Shader(texture, _)) = placed_texture(view)
+                && crate::resource::want_whole(texture as crate::object::This)
+            {
+                REWHOLE.lock().unwrap_or_else(|e| e.into_inner()).push(start);
+            }
+        }
+        View::Shader(texture, _) if crate::resource::buffer_bytes(*texture as crate::object::This).is_none() => {
+            // (A texture object: its slots are keyed by record, made again
+            // by the draws that read it through tables.)
+            let _ = crate::resource::want_whole(*texture as crate::object::This);
+        }
+        _ => {}
+    }
+}
+
 /// The first level with memory of the placed texture at `start` changed:
 /// its slots are made again at the next texture pass.
 pub(crate) fn levels_changed(start: u64) {
@@ -1427,6 +1459,44 @@ impl HostHeap {
                 self.keep(slot, kept);
                 remade += 1;
             }
+        }
+        remade
+    }
+
+    /// [`mark_whole`]: the slots of the placed textures made whole are made
+    /// again from their new host copies and are due in the queue of textures
+    /// picked by index (the new copy is uploaded there). Returns how many.
+    pub(crate) fn texture_views_rewhole(&self, frame: u64) -> usize {
+        if self.sampler {
+            return 0;
+        }
+        let starts = std::mem::take(&mut *REWHOLE.lock().unwrap_or_else(|e| e.into_inner()));
+        if starts.is_empty() {
+            return 0;
+        }
+        let slots: Vec<u32> = {
+            let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            starts.iter().flat_map(|&start| placed.slots_at(start)).collect()
+        };
+        let mut remade = 0;
+        {
+            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            for &slot in &slots {
+                let Some(&key) = made.get(slot as usize) else {
+                    continue;
+                };
+                let Some(view) = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten() else {
+                    continue;
+                };
+                if let Some(kept) = make(&view, self.cpu(slot)) {
+                    self.keep(slot, kept);
+                    remade += 1;
+                }
+            }
+        }
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        for slot in slots {
+            textures.written(slot, frame, 0, false);
         }
         remade
     }
