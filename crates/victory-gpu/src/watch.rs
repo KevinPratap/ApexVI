@@ -984,6 +984,65 @@ struct Guards {
     aliased: BTreeSet<usize>,
     /// blocks guarded since their last remap: still views (VICTORY_GUARD_SEEN)
     views: BTreeSet<usize>,
+    /// [`rest`]: blocks a write fault opened, and when.
+    opened: std::collections::BTreeMap<usize, std::time::Instant>,
+}
+
+impl Guards {
+    /// Whether `block` is left open for now: the title has just written it.
+    fn rests(&self, block: usize, rest: std::time::Duration) -> bool {
+        !rest.is_zero() && self.opened.get(&block).is_some_and(|at| at.elapsed() < rest)
+    }
+
+    /// A write fault opened `block`.
+    fn opened(&mut self, block: usize) {
+        const MANY: usize = 1 << 13;
+        if self.opened.len() >= MANY {
+            self.opened.retain(|_, at| at.elapsed().as_millis() < 50);
+            if self.opened.len() >= MANY {
+                self.opened.clear();
+            }
+        }
+        self.opened.insert(block, std::time::Instant::now());
+    }
+}
+
+/// How long a block the title has just opened by a write is left open by
+/// the guards' askings (`VICTORY_GUARD_REST=<microseconds>`, `1` for 3,000;
+/// unset or `0`: not at all, as before). After the 7900XTX fork
+/// (avatarmanz), where 220 of a frame's 586 faults came within 3 ms after a
+/// refresh had made the block read-only again while the title was still
+/// writing it: made read-only, written, opened, up to a dozen times a frame.
+/// A block that rests counts as written at each asking, so nothing is
+/// missed; it is made read-only at the first asking after its rest. Only
+/// the block written rests: the other views of its pages are guarded as
+/// before.
+fn rest() -> std::time::Duration {
+    static US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let us = *US.get_or_init(|| {
+        std::env::var("VICTORY_GUARD_REST")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(0, |us| if us == 1 { 3000 } else { us.min(100_000) })
+    });
+    std::time::Duration::from_micros(us)
+}
+
+/// With [`rest`]: since the last line, blocks write faults opened, and
+/// blocks an asking left open because they rested.
+static REST_COUNTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// With the frame line, when [`rest`] is on: faults and rests per frame.
+pub(crate) fn rest_line(frames: f64) {
+    if rest().is_zero() {
+        return;
+    }
+    let [opened, rested] = [0, 1].map(|i| REST_COUNTS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    tracing::info!(
+        "guards at rest, per frame (VICTORY_GUARD_REST={} us): {opened:.0} blocks opened by write faults, \
+         {rested:.0} left open by askings",
+        rest().as_micros()
+    );
 }
 
 /// Whether a block once guarded stays known as view memory while its
@@ -1034,6 +1093,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
     views: BTreeSet::new(),
+    opened: std::collections::BTreeMap::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -1067,6 +1127,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         return None;
     }
     install();
+    let rest = rest();
     let mut g = guards();
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
@@ -1106,6 +1167,10 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
+            } else if g.rests(block, rest) {
+                // The title is writing it: left open, and so written again
+                // at the next asking.
+                REST_COUNTS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             } else {
                 run.get_or_insert(block);
                 continue;
@@ -1759,6 +1824,10 @@ fn install() {
         // (then it is ours again, not read-only for some other reason).
         let mut g = guards();
         if open(&mut g, at, at + 1) {
+            if !rest().is_zero() {
+                g.opened(at / BLOCK);
+                REST_COUNTS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             crate::framelog::add(crate::framelog::T::GuardFaults, 1);

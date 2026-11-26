@@ -8261,6 +8261,7 @@ impl Meter {
         let frames = f64::from(self.frames);
         let watch = crate::watch::asks_per_frame(frames);
         crate::watch::absent_line(frames);
+        crate::watch::rest_line(frames);
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
