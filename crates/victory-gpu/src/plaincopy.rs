@@ -85,6 +85,21 @@ static COUNT: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 /// copies in place had won).
 const LEAST: usize = 256;
 
+/// [`LEAST`], or `VICTORY_COPY_PLAIN_LEAST=N` (8 to 4096). Run batch26: about
+/// 5,000 reads a frame under 256 bytes went to the kernel's copy, nearly all
+/// of them fills of 80 to 480 bytes that succeed (about 6 ms a frame of the
+/// submitting thread in ReadProcessMemory); 32 takes those in place and
+/// still leaves the askings of a byte or a word to the kernel.
+fn least() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_COPY_PLAIN_LEAST")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(LEAST, |n| n.clamp(8, 4096))
+    })
+}
+
 /// The 64 KiB blocks of title memory a copy in place faulted in lately:
 /// their copies go straight to the kernel's, which reads round the hole.
 /// By the block's number, in the place its low bits name (a later block
@@ -188,7 +203,7 @@ pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
     if !on() {
         return false;
     }
-    if len < LEAST {
+    if len < least() {
         COUNT[4].fetch_add(1, Relaxed);
         return false;
     }
@@ -216,8 +231,9 @@ pub(crate) fn line(frames: f64) {
     tracing::info!(
         "copies of title memory made in place per frame (VICTORY_COPY_PLAIN=1): {copies:.0}, {:.1} MB; {gone:.1} met a page \
          that was not there and went through the kernel's copy; left to the kernel's copy untried: {lately:.0} whose source \
-         faulted in the last two seconds, {small:.0} of under {LEAST} bytes",
-        bytes / 1e6
+         faulted in the last two seconds, {small:.0} of under {} bytes",
+        bytes / 1e6,
+        least()
     );
 }
 
