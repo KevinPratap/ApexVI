@@ -2759,7 +2759,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         // three a frame of run batch16 read results), never
                         // ahead.
                         if !touches(written, dst, dst + len)
-                            && !copy_after_landing()
+                            && (!copy_after_landing() || fill_ahead::copy_ahead())
                             && fill_ahead::on_copies()
                             && !fill_ahead::hot(src, len)
                         {
@@ -2910,8 +2910,27 @@ mod fill_ahead {
     }
 
     pub(super) fn on() -> bool {
+        fills_ahead() && !WAIT.load(Relaxed)
+    }
+
+    /// Fills may read ahead (`VICTORY_FILL_WAIT=1`: they wait).
+    fn fills_ahead() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_WAIT").is_none_or(|v| v != "1")) && !WAIT.load(Relaxed)
+        *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_WAIT").is_none_or(|v| v != "1"))
+    }
+
+    /// Read-only title buffer copies may read ahead of flights, checked as
+    /// fills are, also with `VICTORY_FILL_WAIT=1` and with
+    /// `VICTORY_COPY_AFTER_LANDING` (for the copies that one leaves in their
+    /// submission): `VICTORY_COPY_AHEAD=1`, off by default. Run batch19: the
+    /// copies that still waited, about 2 a frame (20 KB from the 174 MB
+    /// buffer one flight declares whole), had the same source bytes after
+    /// the wait in 196 of 196 checks; 32 ms a frame of settles. A copy found
+    /// to have missed a write makes copies wait again
+    /// (`VICTORY_FILL_AHEAD_COPY_MISS`).
+    pub(super) fn copy_ahead() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_AHEAD").is_some_and(|v| v == "1"))
     }
 
     /// A title buffer copy found to have read bytes a flight then changed
@@ -2934,7 +2953,7 @@ mod fill_ahead {
 
     /// [`on`] for read-only title buffer copies.
     pub(super) fn on_copies() -> bool {
-        on() && !WAIT_COPIES.load(Relaxed)
+        (fills_ahead() || copy_ahead()) && !WAIT.load(Relaxed) && !WAIT_COPIES.load(Relaxed)
     }
 
     /// A fill (or, `copy`, a read-only title buffer copy) reads `len` bytes
