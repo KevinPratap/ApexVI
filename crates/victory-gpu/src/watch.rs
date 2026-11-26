@@ -1087,6 +1087,110 @@ fn view_known() -> bool {
     }
 }
 
+/// Whether the guards keep their clean blocks in bits too, and an asking
+/// whose blocks are all clean is answered from them with no lock
+/// (`VICTORY_GUARD_BITS=1`; off by default). After the 7900XTX fork's
+/// light refresh (avatarmanz). Run batch29's profile: `guard` took 8.7 % of
+/// the submitting thread, about half of it outside Windows, most of that
+/// reading the clean set block by block for ranges that turned out all
+/// clean (some 150,000 blocks a frame).
+///
+/// A block's bit is set once it is read-only by our hand and noted clean,
+/// under the guards' lock, and cleared under it before it is made writable
+/// or forgotten. So a set bit says what `clean` says: nothing wrote the
+/// block since its copies took it; a write that comes while the bits are
+/// read is as one that comes just after an asking.
+fn guard_bits() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_BITS").is_some_and(|v| v == "1"))
+}
+
+/// One bit per block of the process's address space, in 4 GiB pieces made
+/// when first set and never freed.
+struct Bits([std::sync::atomic::AtomicPtr<BitsPiece>; Bits::PIECES]);
+
+/// The bits of 4 GiB of blocks.
+type BitsPiece = [std::sync::atomic::AtomicU64; Bits::WORDS];
+
+impl Bits {
+    const WORDS: usize = (4 << 30) / BLOCK / 64;
+    /// 128 TiB, what a process has.
+    const PIECES: usize = (128 << 40) / (4 << 30);
+
+    const fn new() -> Bits {
+        Bits([const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; Bits::PIECES])
+    }
+
+    fn piece(&self, word: usize) -> Option<&BitsPiece> {
+        let piece = self.0.get(word / Bits::WORDS)?.load(std::sync::atomic::Ordering::Acquire);
+        // SAFETY: null, or a piece made by `piece_made`, never freed.
+        unsafe { piece.as_ref() }
+    }
+
+    fn piece_made(&self, word: usize) -> Option<&BitsPiece> {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+        let slot = self.0.get(word / Bits::WORDS)?;
+        if slot.load(Acquire).is_null() {
+            let made: Box<BitsPiece> = Box::new([const { std::sync::atomic::AtomicU64::new(0) }; Bits::WORDS]);
+            let made = Box::into_raw(made);
+            if slot.compare_exchange(std::ptr::null_mut(), made, AcqRel, Acquire).is_err() {
+                // SAFETY: ours, never shared.
+                drop(unsafe { Box::from_raw(made) });
+            }
+        }
+        self.piece(word)
+    }
+
+    /// The bits of `[first, last)` within one word: (word, mask).
+    fn words(first: usize, last: usize) -> impl Iterator<Item = (usize, u64)> {
+        (first / 64..last.div_ceil(64)).map(move |word| {
+            let lo = (word * 64).max(first) - word * 64;
+            let hi = ((word + 1) * 64).min(last) - word * 64;
+            let mask = if hi - lo == 64 { u64::MAX } else { ((1u64 << (hi - lo)) - 1) << lo };
+            (word, mask)
+        })
+    }
+
+    fn set(&self, first: usize, last: usize) {
+        for (word, mask) in Bits::words(first, last) {
+            if let Some(piece) = self.piece_made(word) {
+                piece[word % Bits::WORDS].fetch_or(mask, std::sync::atomic::Ordering::Release);
+            }
+        }
+    }
+
+    fn clear(&self, first: usize, last: usize) {
+        for (word, mask) in Bits::words(first, last) {
+            if let Some(piece) = self.piece(word) {
+                piece[word % Bits::WORDS].fetch_and(!mask, std::sync::atomic::Ordering::Release);
+            }
+        }
+    }
+
+    /// Whether every bit of `[first, last)` is set (`first < last`).
+    fn all(&self, first: usize, last: usize) -> bool {
+        Bits::words(first, last).all(|(word, mask)| {
+            self.piece(word)
+                .is_some_and(|piece| piece[word % Bits::WORDS].load(std::sync::atomic::Ordering::Acquire) & mask == mask)
+        })
+    }
+}
+
+/// [`guard_bits`]: the blocks in `Guards::clean`.
+static CLEAN_BITS: Bits = Bits::new();
+
+/// With [`guard_bits`]: since the last line, askings answered by the bits.
+static BITS_ANSWERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// With the frame line, when [`guard_bits`] is on.
+pub(crate) fn bits_line(frames: f64) {
+    if !guard_bits() {
+        return;
+    }
+    let answered = BITS_ANSWERED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames;
+    tracing::info!("guarded askings answered all clean by their bits, per frame (VICTORY_GUARD_BITS=1): {answered:.0}");
+}
+
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
@@ -1110,6 +1214,12 @@ pub(crate) fn clean(page: usize) -> bool {
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    // All clean by the bits: nothing written since the range was last taken,
+    // as the clean set would say below, without its lock.
+    if guard_bits() && start < end && CLEAN_BITS.all(start / BLOCK, end.div_ceil(BLOCK)) {
+        BITS_ANSWERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Some(Vec::new());
+    }
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
@@ -1167,6 +1277,9 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
+                if guard_bits() {
+                    CLEAN_BITS.set(block, block + 1);
+                }
             } else if g.rests(block, rest) {
                 // The title is writing it: left open, and so written again
                 // at the next asking.
@@ -1325,6 +1438,9 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
         g.clean.extend(from..to);
+        if guard_bits() {
+            CLEAN_BITS.set(from, to);
+        }
         if seen_views() || view_known() {
             g.views.extend(from..to);
         }
@@ -1561,6 +1677,7 @@ fn open_with(g: &mut Guards, start: usize, end: usize, one_view: bool) -> bool {
             if one_view && alias / BLOCK != block {
                 // Its copies no longer hold the page; still read-only.
                 g.clean.remove(&(alias / BLOCK));
+                CLEAN_BITS.clear(alias / BLOCK, alias / BLOCK + 1);
             } else if alias / BLOCK != block && open_here(g, alias, alias.saturating_add(BLOCK)) {
                 #[cfg(feature = "diagnostics")]
                 ALIASES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1582,6 +1699,7 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+        CLEAN_BITS.clear(block, block + 1);
         let mut old = 0;
         // SAFETY: a block we made read-only.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
@@ -1796,6 +1914,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+        CLEAN_BITS.clear(block, block + 1);
     }
     let aliased: Vec<usize> = g.aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
     for block in aliased {
@@ -1888,6 +2007,23 @@ mod submission_tests;
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// VICTORY_GUARD_BITS: the bits say all set only where every block was
+    /// set and none cleared since, across words and pieces.
+    #[test]
+    fn guard_bits_answer_only_whole_runs() {
+        let bits = Bits::new();
+        let piece = Bits::WORDS * 64;
+        let (a, b) = (piece - 70, piece + 70);
+        assert!(!bits.all(a, b), "nothing set");
+        bits.set(a, b);
+        assert!(bits.all(a, b) && bits.all(a + 1, a + 2) && bits.all(piece - 1, piece + 1));
+        assert!(!bits.all(a - 1, b) && !bits.all(a, b + 1), "the ends are not set");
+        bits.clear(piece, piece + 1);
+        assert!(!bits.all(a, b) && bits.all(a, piece) && bits.all(piece + 1, b));
+        bits.clear(0, 1);
+        assert!(bits.all(a, piece), "clearing an unmade piece is nothing");
+    }
 
     /// VICTORY_VIEW_MEMO: a remembered view block is forgotten once title
     /// memory is mapped or unmapped.
