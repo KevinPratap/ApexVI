@@ -744,10 +744,27 @@ fn pbits(mode: u16) -> bool {
     matches!(mode, 0 | 1 | 3 | 6 | 7)
 }
 
+/// Whether BC7 channel rotation is restricted to modes 4 and 5
+/// (`VICTORY_BC7_ROTATION=1`). Off by default.
+fn bc7_modes_4_5_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BC7_ROTATION").is_some_and(|v| v == "1"))
+}
+
+/// Channel rotation bits; in the BC7 format only modes 4 and 5 carry a
+/// rotation field (`Marvisak/VIctory#3111`).
+fn rotation(ctrl: u16, modes_4_5_only: bool) -> usize {
+    if !modes_4_5_only || matches!(ctrl & 7, 4 | 5) {
+        usize::from(ctrl >> 3 & 3)
+    } else {
+        0
+    }
+}
+
 /// Channel precisions: the p-bit is red's lowest bit; rotation swaps alpha
 /// with the rotated channel.
-fn bc7_precision(ctrl: u16) -> [u8; 4] {
-    let (mode, rot) = (ctrl & 7, usize::from(ctrl >> 3 & 3));
+fn bc7_precision(ctrl: u16, modes_4_5_only: bool) -> [u8; 4] {
+    let (mode, rot) = (ctrl & 7, rotation(ctrl, modes_4_5_only));
     let mut p = BC7_BITS[usize::from(mode)];
     if rot != 0 {
         p.swap(3, rot - 1);
@@ -764,6 +781,7 @@ fn bc7<'a>(
 ) -> Result<(), Error> {
     let mut history = vec![(Bc7Ep::default(), Bc7Ix::default()); HISTORY];
     let zero = (Bc7Ep::default(), Bc7Ix::default());
+    let modes_4_5_only = bc7_modes_4_5_only();
     for (i, (s, block)) in records.zip(out).enumerate() {
         let (ep_ref, ix_ref) = references(s, true);
         let ctrl = t.ctrl7[usize::from(s[31] & 15) << 5 | usize::from(s[30] & 31)];
@@ -772,7 +790,7 @@ fn bc7<'a>(
         }
         let mode = usize::from(ctrl & 7);
         let subsets = usize::from((ctrl & 0xff) >> 6);
-        let prec = bc7_precision(ctrl);
+        let prec = bc7_precision(ctrl, modes_4_5_only);
         let three = subsets == 3;
         let or0 = |v: u8| if three { 0 } else { v };
         let if3 = |v: u8| if three { v } else { 0 };
@@ -842,17 +860,17 @@ fn bc7<'a>(
             }
         }
         history[i % HISTORY] = (ep, ix);
-        bc7_pack(&ep, &ix, prec, block);
+        bc7_pack(&ep, &ix, prec, modes_4_5_only, block);
     }
     Ok(())
 }
 
-fn bc7_pack(ep: &Bc7Ep, ix: &Bc7Ix, prec: [u8; 4], out: &mut [u8]) {
+fn bc7_pack(ep: &Bc7Ep, ix: &Bc7Ix, prec: [u8; 4], modes_4_5_only: bool, out: &mut [u8]) {
     let ctrl = ep.ctrl;
     let mode = ctrl & 7;
     let subsets = usize::from((ctrl & 0xff) >> 6);
     let part = usize::from(ctrl >> 8 & 63);
-    let rot = usize::from(ctrl >> 3 & 3);
+    let rot = rotation(ctrl, modes_4_5_only);
     let mut w = Bits::default();
     w.put(1 << mode, u32::from(mode) + 1);
     match mode {
@@ -1603,6 +1621,47 @@ mod tests {
             let anchor = 0..1 << (ix.bits[0] - 1);
             let ok = (ix.bits[1] != 0 || ix.ix[1] == [0; 16]) && anchor.contains(&ix.ix[0][0]);
             assert!(ok, "entry {k}: {:?}", ix.ix);
+        }
+    }
+
+    #[test]
+    fn bc7_rotation_applies_only_to_modes_4_and_5() {
+        for mode in [0u16, 1, 2, 3, 6, 7] {
+            let subsets = match mode {
+                0 | 2 => 3u16,
+                1 | 3 | 7 => 2,
+                _ => 1,
+            };
+            let base_ctrl = mode | (subsets << 6);
+            let base_prec = bc7_precision(base_ctrl, true);
+            assert!(base_prec[0] > 0 && base_prec[1] > 0 && base_prec[2] > 0);
+            let mut base_out = [0u8; 16];
+            let base_ep = Bc7Ep {
+                ctrl: base_ctrl,
+                rows: [[0xa500; 8]; 3],
+            };
+            let ix = Bc7Ix {
+                bits: BC7_INDEX[usize::from(mode)],
+                ix: [[1; 16], [0; 16]],
+            };
+            bc7_pack(&base_ep, &ix, base_prec, true, &mut base_out);
+            for rot in 1u16..=3 {
+                let ctrl = base_ctrl | (rot << 3);
+                assert_eq!(bc7_precision(ctrl, true), base_prec, "mode {mode} rot {rot}");
+                let mut out = [0u8; 16];
+                let ep = Bc7Ep {
+                    ctrl,
+                    rows: base_ep.rows,
+                };
+                bc7_pack(&ep, &ix, bc7_precision(ctrl, true), true, &mut out);
+                assert_eq!(out, base_out, "mode {mode} rot {rot}");
+            }
+        }
+        for mode in [4u16, 5] {
+            let ctrl = mode | (1 << 6) | (1 << 3);
+            let prec = bc7_precision(ctrl, true);
+            assert_eq!(prec[0], BC7_BITS[usize::from(mode)][3]);
+            assert_eq!(prec[3], BC7_BITS[usize::from(mode)][0]);
         }
     }
 }
