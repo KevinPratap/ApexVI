@@ -2318,11 +2318,27 @@ impl State {
                     );
                 }
             }
-            let view = pass_timed(8, || heap.handle(index).and_then(|handle| host.mirror(index, handle, true)));
+            // A slot not made from what it holds now is shown once its
+            // texture's upload has run (`show_after`): made at once, the
+            // frames already on the card read the new host texture empty.
+            let late = crate::descriptor::host::show_after()
+                && heap.handle(index).is_some_and(|handle| !host.made_from(index, handle));
+            let view = pass_timed(8, || {
+                heap.handle(index).and_then(|handle| {
+                    if late { crate::descriptor::view(handle) } else { host.mirror(index, handle, true) }
+                })
+            });
+            // Nothing of this pass uploads it: made now after all.
+            let at_once = || {
+                if late && let Some(handle) = heap.handle(index) {
+                    let _ = host.mirror(index, handle, true);
+                }
+            };
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
                 _ => {
+                    at_once();
                     host.texture_slot_done(index, write, None);
                     continue;
                 }
@@ -2330,6 +2346,7 @@ impl State {
             let title_fills = crate::resource::host_resource(resource).is_some_and(crate::texture::title_written);
             if !title_fills {
                 // a render target, a depth or unordered access texture: the host's own
+                at_once();
                 host.texture_slot_done(index, write, None);
                 continue;
             }
@@ -2370,6 +2387,14 @@ impl State {
             };
             if again.is_some() {
                 HEAP_TEXTURES_PARTLY[1].fetch_add(1, Ordering::Relaxed);
+            }
+            if late && let Some(handle) = heap.handle(index) {
+                if tabled {
+                    // Draws that read it through a table upload it.
+                    let _ = host.mirror(index, handle, true);
+                } else {
+                    host.flip_after(list, handle);
+                }
             }
             if tabled {
                 // Nothing was staged here, so nothing is counted or spent,

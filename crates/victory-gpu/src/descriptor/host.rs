@@ -2083,6 +2083,31 @@ impl HostHeap {
         Some(view)
     }
 
+    /// Whether slot `index` is made from the record the title slot at
+    /// `handle` holds now ([`show_after`]).
+    pub(crate) fn made_from(&self, index: u32, handle: u64) -> bool {
+        let key = record_key(handle);
+        key != 0 && self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize) == Some(&key)
+    }
+
+    /// [`show_after`]: slot `index`, written with the record at `handle`, is
+    /// made once the submission `list` goes out in has finished (the list
+    /// uploads its texture); until then it shows what it showed.
+    pub(crate) fn flip_after(&self, list: &crate::host::HostList, handle: u64) {
+        let key = record_key(handle);
+        if key == 0 {
+            return;
+        }
+        let asked = crate::frame::current();
+        FLIPPED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Run as the list's submission is prepared: its number is the one
+        // that has started.
+        list.defer_host(move || {
+            let after = crate::host::submissions_started();
+            FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push((after, handle, key, asked));
+        });
+    }
+
     // the slot's host descriptor is made again at the next mirror (its copy left the tables)
     pub(crate) fn forget_made(&self, index: u32) {
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
@@ -3099,6 +3124,38 @@ fn kin(old: &View, new: &View) -> Kin {
     }
 }
 
+/// Whether a slot of the textures picked by index that is written with a
+/// new view shows it only once the submission that uploads its texture has
+/// finished (`VICTORY_SHOW_AFTER=1`; off by default: made at once, as
+/// before). After avatarmanz/VIctory-7900XTX (`VICTORY_SHOW_AFTER`,
+/// `texture_slot_flip`): "Shown at once, the lists already on the card read
+/// it by index while it is made". Here the texture pass (`crate::draw`)
+/// made the slot at once and only recorded the upload in a list that ran
+/// later, so the frames already on the card (two ahead) read the new host
+/// texture empty: the title's loading art went black for two or three
+/// frames at a time. With the switch the slot goes on showing what it
+/// showed until the upload has run ([`texture_flips`]).
+pub(crate) fn show_after() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHOW_AFTER").is_some_and(|v| v == "1"))
+}
+
+/// The key of the record the title slot at `handle` holds now (as
+/// [`HostHeap::mirror`] keys a made slot); 0 if it holds no view of ours.
+pub(crate) fn record_key(handle: u64) -> u64 {
+    // SAFETY: the handle is a descriptor slot in title memory.
+    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    if tag == VIEW_TAG { u64::from(generation) << 32 | u64::from(i) } else { 0 }
+}
+
+/// [`show_after`]: slots to make once a submission has finished, as
+/// (submission, title slot handle, record key, frame asked).
+pub(crate) static FLIPS: Mutex<Vec<(u64, u64, u64, u64)>> = Mutex::new(Vec::new());
+
+/// [`show_after`], since the start: flips queued, made, dropped (the slot
+/// was written again, or went), the frames they waited in all, the most.
+pub(crate) static FLIPPED: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
 /// Whether a slot that is written with a view of another texture, one that
 /// has to wait for its host copy, goes on showing the texture it shows until
 /// the new one is made and uploaded (`VICTORY_KEEP_SHOWN`; unset or 0: no,
@@ -3338,6 +3395,32 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// VICTORY_SHOW_AFTER: a title slot's record key as `mirror` keys it,
+    /// none for a slot without a view of ours; a flip waits for its
+    /// submission, and one whose slot no longer holds its record (or whose
+    /// heap is gone) is dropped, not made.
+    #[test]
+    fn flips_wait_for_their_submission_and_drop_when_rewritten() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let record = [VIEW_TAG, 7u32, 3u32];
+        let handle = record.as_ptr() as u64;
+        assert_eq!(record_key(handle), 3u64 << 32 | 7);
+        let other = [VIEW_TAG ^ 1, 7u32, 3u32];
+        assert_eq!(record_key(other.as_ptr() as u64), 0, "no view of ours");
+        let dropped = FLIPPED[2].load(Relaxed);
+        FLIPS.lock().unwrap().push((50_000_000, handle, record_key(handle), 0));
+        assert_eq!(crate::descriptor::texture_flips(49_999_999), 0);
+        assert!(FLIPS.lock().unwrap().iter().any(|f| f.1 == handle), "not due: it waits");
+        // Due, but in no registered heap (as a heap that went): dropped.
+        assert_eq!(crate::descriptor::texture_flips(50_000_000), 0);
+        assert!(!FLIPS.lock().unwrap().iter().any(|f| f.1 == handle), "taken off");
+        assert!(FLIPPED[2].load(Relaxed) > dropped, "counted dropped");
+        // Written again before it was due: dropped too.
+        FLIPS.lock().unwrap().push((50_000_001, handle, 99, 0));
+        assert_eq!(crate::descriptor::texture_flips(50_000_001), 0);
+        assert!(!FLIPS.lock().unwrap().iter().any(|f| f.1 == handle));
+    }
 
     /// VICTORY_KEEP_SHOWN: a placed texture of the same description is
     /// "moved", the same texture streamed at another size "sized", another

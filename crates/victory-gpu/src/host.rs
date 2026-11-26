@@ -177,6 +177,12 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
     }
 }
 
+/// The number of the last submission that started (for work deferred into
+/// it, as `descriptor::host::show_after`'s).
+pub(crate) fn submissions_started() -> u64 {
+    STARTED.load(Ordering::Acquire)
+}
+
 /// How much of a submission's preparation runs beside its other parts
 /// (`VICTORY_PREP_SPLIT`; 0, unset: none, as before). Steps of
 /// docs/prep-split-plan.md. 1 (A1): the records the title copied into its
@@ -5811,6 +5817,11 @@ impl Host {
             } else {
                 self.settle(&mut submitted, why);
             }
+        }
+        // Slots of textures picked by index whose upload has run since they
+        // were written (`show_after`): made now, before lists read them.
+        if crate::descriptor::host::show_after() {
+            crate::descriptor::texture_flips(FINISHED.load(Ordering::Acquire));
         }
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted: beside the
