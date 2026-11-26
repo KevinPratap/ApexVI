@@ -1430,6 +1430,48 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
     wide(jobs);
 }
 
+/// A job started on the kept threads by [`wide_start`], to be joined.
+pub(crate) struct Started(Arc<(Mutex<bool>, std::sync::Condvar)>);
+
+/// Starts `job` on the kept threads ([`wide`]'s) and returns at once; the
+/// caller joins it with [`Started::join`] before it needs what it did.
+pub(crate) fn wide_start(job: Box<dyn FnOnce() + Send>) -> Started {
+    let workers = workers();
+    let done = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    {
+        let done = done.clone();
+        workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).push_back(Box::new(move || {
+            job();
+            *done.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            done.1.notify_all();
+        }));
+    }
+    workers.more.notify_one();
+    Started(done)
+}
+
+impl Started {
+    /// Returns once the job has run. While it waits it runs what the kept
+    /// threads have not taken yet (the job itself, if none took it), so it
+    /// waits only for jobs already running.
+    pub(crate) fn join(self) {
+        loop {
+            if *self.0.0.lock().unwrap_or_else(|e| e.into_inner()) {
+                return;
+            }
+            let job = workers().jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+            match job {
+                Some(job) => job(),
+                None => break,
+            }
+        }
+        let mut done = self.0.0.lock().unwrap_or_else(|e| e.into_inner());
+        while !*done {
+            done = self.0.1.wait(done).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
 /// About this many bytes to a piece of work for [`wide`].
 const WIDE_JOB: usize = 1 << 20;
 
@@ -1621,6 +1663,37 @@ pub(crate) fn back_line(frames: f64) {
 mod wide_tests {
     use super::{Job, PIECE, WIDE_JOB, copy_jobs, find_pieces, wide};
     use std::sync::Arc;
+
+    /// VICTORY_PREP_SPLIT: a started job runs beside the caller, and the
+    /// join returns only after it has run, whether a kept thread took it or
+    /// the joining thread did.
+    #[test]
+    fn started_jobs_are_done_at_their_join() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let done = Arc::new(AtomicUsize::new(0));
+        let started: Vec<_> = (0..12)
+            .map(|i| {
+                let done = done.clone();
+                super::wide_start(Box::new(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(5 + i % 3 * 10));
+                    done.fetch_add(1, Ordering::SeqCst);
+                }))
+            })
+            .collect();
+        // More jobs than kept threads: some are run by this one at the join.
+        for s in started {
+            s.join();
+        }
+        assert_eq!(done.load(Ordering::SeqCst), 12, "every started job ran before its join returned");
+        let flag = Arc::new(AtomicUsize::new(0));
+        let f = flag.clone();
+        let one = super::wide_start(Box::new(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            f.store(1, Ordering::SeqCst);
+        }));
+        one.join();
+        assert_eq!(flag.load(Ordering::SeqCst), 1, "the join waited for a job a kept thread was running");
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Every job runs once, however many there are, and `wide` returns
