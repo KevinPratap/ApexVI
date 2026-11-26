@@ -8167,18 +8167,44 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
 /// in the present's own list, so composing adds no submission or wait.
 /// The shaders and blending are those of upstream #1997 (Yaekai's #211):
 /// the scene opaque, then each later plane with premultiplied alpha.
+/// Whether `PresentX` planes honour `pSrcViewRects`, `straight_alpha`
+/// (`flags & 0x2`), and max-plane output sizing (`VICTORY_PRESENT_RECTS=1`;
+/// ported from `realblastex/flamingo` and `Marvisak/VIctory#1997`). Off by default.
+pub(crate) fn present_rects() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRESENT_RECTS").is_some_and(|v| v == "1"))
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PresentPlane<'a> {
+    pub(crate) texture: &'a ID3D12Resource,
+    pub(crate) state: u32,
+    pub(crate) src_rect: Option<[i32; 4]>,
+    pub(crate) straight_alpha: bool,
+}
+
 const COMPOSE: &str = r#"
-#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter = FILTER_MIN_MAG_MIP_LINEAR, addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP, visibility = SHADER_VISIBILITY_PIXEL)"
+#define RS "RootConstants(num32BitConstants = 6, b0), DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter = FILTER_MIN_MAG_MIP_LINEAR, addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP, visibility = SHADER_VISIBILITY_PIXEL)"
+cbuffer Params : register(b0) {
+    float4 uv_rect;
+    uint straight_alpha;
+    uint pad0;
+};
 Texture2D tex : register(t0);
 SamplerState smp : register(s0);
 [RootSignature(RS)]
 void vs(uint id : SV_VertexID, out float4 pos : SV_Position, out float2 uv : TEXCOORD) {
-    uv = float2((id << 1) & 2, id & 2);
-    pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    float2 raw_uv = float2((id << 1) & 2, id & 2);
+    pos = float4(raw_uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    uv = lerp(uv_rect.xy, uv_rect.zw, raw_uv);
 }
 [RootSignature(RS)]
 float4 ps(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
-    return tex.Sample(smp, uv);
+    float4 c = tex.Sample(smp, uv);
+    if (straight_alpha != 0) {
+        c.rgb *= c.a;
+    }
+    return c;
 }
 "#;
 
@@ -8337,11 +8363,11 @@ impl Composer {
         list: &ID3D12GraphicsCommandList,
         output: &ID3D12Resource,
         (width, height): (u32, u32),
-        scene: (&ID3D12Resource, D3D12_RESOURCE_STATES),
-        overlays: &[(&ID3D12Resource, u32)],
+        planes_in: &[PresentPlane<'_>],
     ) {
-        let planes: Vec<(&ID3D12Resource, D3D12_RESOURCE_STATES)> = std::iter::once(scene)
-            .chain(overlays.iter().map(|&(t, s)| (t, D3D12_RESOURCE_STATES(s as i32))))
+        let planes: Vec<(&ID3D12Resource, D3D12_RESOURCE_STATES, Option<[i32; 4]>, bool)> = planes_in
+            .iter()
+            .map(|p| (p.texture, D3D12_RESOURCE_STATES(p.state as i32), p.src_rect, p.straight_alpha))
             .take(COMPOSE_PLANES as usize)
             .collect();
         let base = (self.next % COMPOSE_RING) * COMPOSE_PLANES;
@@ -8352,8 +8378,26 @@ impl Composer {
             let gpu = self.srv.GetGPUDescriptorHandleForHeapStart();
             let mut before = Vec::with_capacity(planes.len() + 1);
             let mut after = Vec::with_capacity(planes.len() + 1);
-            for (i, &(texture, state)) in planes.iter().enumerate() {
+            let mut params: Vec<[u32; 6]> = Vec::with_capacity(planes.len());
+            for (i, &(texture, state, src_rect, straight_alpha)) in planes.iter().enumerate() {
                 let d = texture.GetDesc();
+                let uv = match src_rect {
+                    Some([l, t, r, b]) if d.Width > 0 && d.Height > 0 => [
+                        (l as f32) / (d.Width as f32),
+                        (t as f32) / (d.Height as f32),
+                        (r as f32) / (d.Width as f32),
+                        (b as f32) / (d.Height as f32),
+                    ],
+                    _ => [0.0f32, 0.0, 1.0, 1.0],
+                };
+                params.push([
+                    uv[0].to_bits(),
+                    uv[1].to_bits(),
+                    uv[2].to_bits(),
+                    uv[3].to_bits(),
+                    u32::from(i > 0 && straight_alpha),
+                    0,
+                ]);
                 device.CreateShaderResourceView(
                     texture,
                     Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
@@ -8366,7 +8410,7 @@ impl Composer {
                     }),
                     D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu.ptr + ((base + i as u32) * self.srv_step) as usize },
                 );
-                let first = planes[..i].iter().all(|(earlier, _)| earlier.as_raw() != texture.as_raw());
+                let first = planes[..i].iter().all(|(earlier, _, _, _)| earlier.as_raw() != texture.as_raw());
                 if first && state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
                     before.push(transition(texture, state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
                     after.push(transition(texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, state));
@@ -8390,9 +8434,10 @@ impl Composer {
             list.RSSetScissorRects(&[RECT { left: 0, top: 0, right: width as i32, bottom: height as i32 }]);
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
             list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            for i in 0..planes.len() as u32 {
+            for (i, consts) in params.iter().enumerate() {
                 list.SetPipelineState(if i == 0 { &self.opaque } else { &self.overlay });
-                list.SetGraphicsRootDescriptorTable(0, D3D12_GPU_DESCRIPTOR_HANDLE { ptr: gpu.ptr + u64::from((base + i) * self.srv_step) });
+                list.SetGraphicsRoot32BitConstants(0, 6, consts.as_ptr().cast(), 0);
+                list.SetGraphicsRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE { ptr: gpu.ptr + u64::from((base + i as u32) * self.srv_step) });
                 list.DrawInstanced(3, 1, 0, 0);
             }
             list.ResourceBarrier(&after);
@@ -8842,14 +8887,27 @@ impl Host {
         overlays: &[(&ID3D12Resource, u32)],
         frame: u64,
     ) -> Option<bool> {
+        let mut all = Vec::with_capacity(1 + overlays.len());
+        all.push(PresentPlane { texture, state, src_rect: None, straight_alpha: false });
+        for &(t, s) in overlays {
+            all.push(PresentPlane { texture: t, state: s, src_rect: None, straight_alpha: false });
+        }
+        self.present_planes_cropped(&all, frame)
+    }
+
+    pub(crate) fn present_planes_cropped(
+        &self,
+        planes: &[PresentPlane<'_>],
+        frame: u64,
+    ) -> Option<bool> {
+        let first = planes.first()?;
         if crate::resource::mip_drop_ui_level() >= 2 {
-            note_presented(texture.as_raw() as usize);
-            for (overlay, _) in overlays {
-                note_presented(overlay.as_raw() as usize);
+            for p in planes {
+                note_presented(p.texture.as_raw() as usize);
             }
         }
         let showing = std::time::Instant::now();
-        let shown = self.present_now(texture, state, overlays, frame);
+        let shown = self.present_now(first.texture, first.state, planes, frame);
         crate::framelog::add(crate::framelog::T::PresentShowUs, showing.elapsed().as_micros() as u64);
         shown
     }
@@ -8858,7 +8916,7 @@ impl Host {
         &self,
         texture: &ID3D12Resource,
         state: u32,
-        overlays: &[(&ID3D12Resource, u32)],
+        planes: &[PresentPlane<'_>],
         frame: u64,
     ) -> Option<bool> {
         // SAFETY: a live resource.
@@ -8867,12 +8925,31 @@ impl Host {
             tracing::warn!(format = desc.Format.0, "cannot present this format");
             return None;
         };
-        let (width, height) = (desc.Width as u32, desc.Height);
-        // With planes over the scene: the composer (made for the swap
-        // format) and its output, of the scene's size, so the swap chain
-        // keeps its size whether or not a UI plane comes with a frame.
+        let (mut width, mut height) = (desc.Width as u32, desc.Height);
+        let cropped_single = present_rects()
+            && planes.len() == 1
+            && planes[0].src_rect.is_some_and(|r| r != [0, 0, desc.Width as i32, desc.Height as i32]);
+        if present_rects() {
+            let (mut mw, mut mh) = (0u32, 0u32);
+            for p in planes {
+                // SAFETY: live resource.
+                let pd = unsafe { p.texture.GetDesc() };
+                let (pw, ph) = match p.src_rect {
+                    Some([l, t, r, b]) if r > l && b > t => ((r - l) as u32, (b - t) as u32),
+                    _ => (pd.Width as u32, pd.Height),
+                };
+                mw = mw.max(pw);
+                mh = mh.max(ph);
+            }
+            if mw > 0 && mh > 0 {
+                (width, height) = (mw, mh);
+            }
+        }
+        let need_compose = planes.len() > 1 || cropped_single || (width, height) != (desc.Width as u32, desc.Height);
+        // With planes over the scene (or a cropped single plane): the composer
+        // and its output.
         let mut composer = COMPOSER.lock().unwrap_or_else(|e| e.into_inner());
-        let composing = if overlays.is_empty() {
+        let composing = if !need_compose {
             None
         } else {
             if composer.as_ref().is_some_and(|c| c.as_ref().is_some_and(|c| c.format != format)) {
@@ -8881,7 +8958,7 @@ impl Host {
             }
             let made = composer.get_or_insert_with(|| match Composer::new(&self.device, format) {
                 Ok(c) => {
-                    tracing::info!(planes = overlays.len() + 1, format = format.0, "presents with several planes are composed");
+                    tracing::info!(planes = planes.len(), format = format.0, "presents with several planes are composed");
                     Some(c)
                 }
                 Err(e) => {
@@ -8965,7 +9042,7 @@ impl Host {
             // Planes over the scene: drawn into the composer's output, which
             // is then shown in the scene's place.
             let composed = composing.map(|(c, out)| {
-                c.record(&self.device, list, &out, (width, height), (texture, state), overlays);
+                c.record(&self.device, list, &out, (width, height), planes);
                 out
             });
             let (texture, state) = match &composed {
