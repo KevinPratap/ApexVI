@@ -386,16 +386,45 @@ fn unknown_pipeline_blobs(slot: usize, desc: usize) {
         // (At most 4,096 logged: the run's log stays readable.)
         if blobs.len() < 4096 && blobs.insert(*full.as_bytes()) {
             let magic: String = blob[..4].iter().map(|&b| if b.is_ascii_graphic() { b as char } else { '.' }).collect();
+            // With `VICTORY_CODE_INDEX=1`: the blob among the native programs of
+            // the title's containers (`pipeline::code_index`).
+            let (found, indexed) = if crate::pipeline::code_index::on() {
+                crate::pipeline::code_index::look(&blob)
+            } else {
+                (None, 0)
+            };
+            let matched = found
+                .map(|((shader, stage), how, at)| format!("{stage} of shader {shader} ({how}, at byte {at})"))
+                .unwrap_or_else(|| "none".to_owned());
             tracing::info!(
                 slot = format_args!("{slot:#x}"),
                 word = i,
                 size,
                 hash = &full.to_hex()[..16],
                 magic,
+                indexed,
+                matched,
                 "unknown pipeline method: a blob in its description"
             );
         }
+        // `VICTORY_DUMP_UNKNOWN_PIPELINES=<dir>`: the first 32 descriptions
+        // of each slot written as they are, words and blobs, for study.
+        if let Some(dir) = dump_dir() {
+            let n = distinct[which];
+            if n <= 32 {
+                let base = dir.join(format!("{slot:x}-{n:02}"));
+                let _ = std::fs::create_dir_all(&base);
+                let _ = std::fs::write(base.join("words.bin"), bytes);
+                let _ = std::fs::write(base.join(format!("w{i:02}-{size}.bin")), &blob);
+            }
+        }
     }
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn dump_dir() -> Option<&'static std::path::Path> {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| std::env::var_os("VICTORY_DUMP_UNKNOWN_PIPELINES").map(std::path::PathBuf::from)).as_deref()
 }
 
 /// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
