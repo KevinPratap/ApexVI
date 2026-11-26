@@ -28,6 +28,20 @@ fn remembers() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CLZERO_ASK").is_none_or(|v| v != "1"))
 }
 
+/// Writable regions each thread remembers ([`remembers`]): `VICTORY_CLZERO_REGIONS=N` (1 to
+/// 1024; 4 by default, as before). The title's pages are mapped one view each, so a block a
+/// `clzero` loop zeroes crosses several, and four did not hold them: run batch22's profile
+/// had the recording threads 7.4 ms a frame inside VirtualQuery from here.
+fn clzero_regions() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_CLZERO_REGIONS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(4, |n| n.clamp(1, 1024))
+    })
+}
+
 /// Answers a remembered region gives before Windows is asked about it again: one freed or
 /// protected meanwhile is forgotten then.
 const ANSWERS: u32 = 4096;
@@ -35,7 +49,7 @@ const ANSWERS: u32 = 4096;
 thread_local! {
     /// The regions Windows last said are committed and writable (start, end), newest first,
     /// and the answers they gave since they were emptied.
-    static WRITABLE: Cell<([(usize, usize); 4], u32)> = const { Cell::new(([(0, 0); 4], 0)) };
+    static WRITABLE: std::cell::RefCell<(Vec<(usize, usize)>, u32)> = const { std::cell::RefCell::new((Vec::new(), 0)) };
     /// Faulting addresses and the code bytes found readable there, newest first.
     static CODE: Cell<[(usize, usize); 8]> = const { Cell::new([(0, 0); 8]) };
 }
@@ -221,10 +235,18 @@ fn writable_to(va: usize, end: usize) -> Option<usize> {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualQuery};
     let remember = remembers();
     if remember {
-        let (regions, answers) = WRITABLE.with(Cell::get);
-        if let Some(&(_, to)) = regions.iter().find(|&&(from, to)| from <= va && va < to) {
-            let next = if answers >= ANSWERS { ([(0, 0); 4], 0) } else { (regions, answers + 1) };
-            WRITABLE.with(|w| w.set(next));
+        let hit = WRITABLE.with(|w| {
+            let mut w = w.borrow_mut();
+            let to = w.0.iter().find(|&&(from, to)| from <= va && va < to).map(|&(_, to)| to)?;
+            if w.1 >= ANSWERS {
+                w.0.clear();
+                w.1 = 0;
+            } else {
+                w.1 += 1;
+            }
+            Some(to)
+        });
+        if let Some(to) = hit {
             return Some(to.min(end));
         }
     }
@@ -239,10 +261,9 @@ fn writable_to(va: usize, end: usize) -> Option<usize> {
     let (from, to) = (m.BaseAddress as usize, m.BaseAddress as usize + m.RegionSize);
     if remember {
         WRITABLE.with(|w| {
-            let (mut regions, answers) = w.get();
-            regions.rotate_right(1);
-            regions[0] = (from, to);
-            w.set((regions, answers));
+            let mut w = w.borrow_mut();
+            w.0.insert(0, (from, to));
+            w.0.truncate(clzero_regions());
         });
     }
     Some(to.min(end))
