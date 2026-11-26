@@ -46,6 +46,7 @@ $newest = @{
     VICTORY_INDIRECT_ZERO_GARBAGE = '1'; VICTORY_SDWA_SEXT_16 = '1'; VICTORY_SYNC_BARRIER = '1'
     VICTORY_TEXTURE_CHANGING = '1'; VICTORY_PAGE_WRITES = 'all'; VICTORY_SPATIAL_NO_JITTER = '1'
     VICTORY_PREP_SPLIT = '2'; VICTORY_PARALLEL_REFRESH = '1'; VICTORY_SECTION_MB = '2'
+    VICTORY_HEAP_WALK_THREAD = '1'; VICTORY_CARD_REHASH_RUNS = '1'
 }
 if ($FidelityFx -and (Test-Path (Join-Path $FidelityFx 'amd_fidelityfx_upscaler_dx12.dll'))) {
     $settings['VICTORY_FIDELITYFX_DIR'] = (Resolve-Path $FidelityFx).Path
