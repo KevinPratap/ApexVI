@@ -1909,6 +1909,19 @@ pub(crate) fn merge_buffers() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_MERGE_BUFFERS").is_some_and(|v| v == "1"))
 }
 
+/// Whether [`changed_runs_into`] skips equal bytes [`CHUNK`] at a time first
+/// (`VICTORY_MERGE_CHUNKS=1`; off by default). Run batch28: the merge beside
+/// flights compared thousands of 64 KiB pages a frame eight bytes at a time
+/// (`card_masked` about 18 ms a frame); a page the write watch flags changes
+/// in a few places, and the rest is equal. The runs come out the same.
+pub(crate) fn merge_chunks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MERGE_CHUNKS").is_some_and(|v| v == "1"))
+}
+
+/// [`merge_chunks`]: bytes compared at a time.
+const CHUNK: usize = 256;
+
 thread_local! {
     /// [`merge_buffers`]: the changed runs of the page being merged.
     static RUNS: std::cell::RefCell<Vec<(usize, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -1916,10 +1929,22 @@ thread_local! {
 
 /// [`changed_runs`], appended to `runs`.
 pub(crate) fn changed_runs_into(now: &[u8], was: &[u8], runs: &mut Vec<(usize, usize)>) {
+    changed_runs_with(now, was, runs, merge_buffers(), merge_chunks());
+}
+
+/// [`changed_runs_into`] with its ways of skipping equal bytes chosen:
+/// `words` eight at a time as words, `chunks` [`CHUNK`] at a time first.
+fn changed_runs_with(now: &[u8], was: &[u8], runs: &mut Vec<(usize, usize)>, words: bool, chunks: bool) {
     let n = now.len().min(was.len());
-    let words = merge_buffers();
     let mut i = 0;
     while i < n {
+        // Equal bytes a chunk at a time while they last (`merge_chunks`):
+        // the slice compare is the runtime's vectorised memcmp.
+        if chunks {
+            while i + CHUNK <= n && now[i..i + CHUNK] == was[i..i + CHUNK] {
+                i += CHUNK;
+            }
+        }
         // Equal bytes, eight at a time while they last.
         if words {
             while i + 8 <= n {
@@ -2054,6 +2079,41 @@ mod merge_tests {
 
     /// The runs hold exactly the bytes that differ: putting them into the
     /// old bytes gives the new ones, and no run holds an equal byte.
+    #[test]
+    fn chunked_runs_match_the_byte_by_byte_runs() {
+        // Sparse changes at chunk edges, inside chunks, and a run across a
+        // chunk boundary: the chunk skip finds the same runs as the scan.
+        let was: Vec<u8> = (0..4096u32).map(|i| (i * 31 + 7) as u8).collect();
+        let mut now = was.clone();
+        for &at in &[0usize, 255, 256, 257, 700, 1023, 1024, 2047, 3000, 4095] {
+            now[at] ^= 0x5a;
+        }
+        for b in now.iter_mut().take(530).skip(500) {
+            *b ^= 0x11;
+        }
+        let mut plain = Vec::new();
+        let n = now.len();
+        let mut i = 0;
+        while i < n {
+            while i < n && now[i] == was[i] {
+                i += 1;
+            }
+            if i >= n {
+                break;
+            }
+            let first = i;
+            while i < n && now[i] != was[i] {
+                i += 1;
+            }
+            plain.push((first, i - first));
+        }
+        for (words, chunks) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut runs = Vec::new();
+            super::changed_runs_with(&now, &was, &mut runs, words, chunks);
+            assert_eq!(runs, plain, "words {words}, chunks {chunks}");
+        }
+    }
+
     #[test]
     fn changed_runs_are_exactly_the_bytes_that_differ() {
         let was: Vec<u8> = (0..300u32).map(|i| (i * 13 + 5) as u8).collect();
