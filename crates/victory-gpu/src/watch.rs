@@ -1293,7 +1293,7 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
 
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.
 fn uncommitted_end(block: usize) -> usize {
-    if absent_cache() {
+    if absent_cache() != 0 {
         let at = ABSENT_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
         let mut cache = ABSENT.lock().unwrap_or_else(|e| e.into_inner());
         if cache.0 != at {
@@ -1305,16 +1305,37 @@ fn uncommitted_end(block: usize) -> usize {
             return end;
         }
         drop(cache);
-        let end = uncommitted_end_asked(block);
+        let (base, end) = uncommitted_region(block);
         if end > block {
             let mut cache = ABSENT.lock().unwrap_or_else(|e| e.into_inner());
             if cache.0 == at {
-                cache.1.insert(block, end);
+                // Mode 2: under the region's first block, so that every block
+                // of it finds the answer (mode 1: under the block asked about).
+                cache.1.insert(if absent_cache() == 2 { base } else { block }, end);
             }
         }
         return end;
     }
-    uncommitted_end_asked(block)
+    uncommitted_region(block).1
+}
+
+/// With [`absent_cache`] 2: a mapping the runtime announces over
+/// `[at, at + len)` drops only the cached regions it touches.
+fn absent_remapped(at: usize, len: usize) {
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    let mut cache = ABSENT.lock().unwrap_or_else(|e| e.into_inner());
+    let gone: Vec<usize> = cache
+        .1
+        .range(..last)
+        .rev()
+        // The regions do not overlap: below the first that ends before
+        // `first`, none reaches it.
+        .take_while(|&(_, &end)| end > first)
+        .map(|(&start, _)| start)
+        .collect();
+    for start in gone {
+        cache.1.remove(&start);
+    }
 }
 
 /// Whether [`uncommitted_end`]'s answers stand for the rest of a
@@ -1327,9 +1348,19 @@ fn uncommitted_end(block: usize) -> usize {
 /// next submission's asking (`ask_once`) or a mapping the runtime announces
 /// ([`title_memory_remapped`]): a commit in between is seen by the next
 /// submission instead.
-fn absent_cache() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_ABSENT_CACHE").is_some_and(|v| v == "1"))
+///
+/// `VICTORY_GUARD_ABSENT_CACHE=2`: each region kept under its first block
+/// (any block of it then finds it), and a mapping the runtime announces
+/// drops only the regions it touches. Run batch26: mode 1 still left 11.5
+/// ms a frame of VirtualQuery, the regions kept under the block first asked
+/// about and every announced mapping (about 17 a frame) emptying them all.
+fn absent_cache() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_GUARD_ABSENT_CACHE").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
 }
 
 /// [`absent_cache`]: the time the regions below stand for, and those
@@ -1337,7 +1368,9 @@ fn absent_cache() -> bool {
 static ABSENT_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ABSENT: Mutex<(u64, BTreeMap<usize, usize>)> = Mutex::new((0, BTreeMap::new()));
 
-fn uncommitted_end_asked(block: usize) -> usize {
+/// The uncommitted region holding `block`: its first block and its end, or
+/// `(block, block)` if `block` is committed.
+fn uncommitted_region(block: usize) -> (usize, usize) {
     use windows_sys::Win32::System::Memory::{
         MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
@@ -1346,9 +1379,10 @@ fn uncommitted_end_asked(block: usize) -> usize {
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
     if n != 0 && matches!(info.State, MEM_RESERVE | MEM_FREE) {
-        (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK
+        let end = (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK;
+        ((info.BaseAddress as usize / BLOCK).min(block), end)
     } else {
-        block
+        (block, block)
     }
 }
 
@@ -1578,7 +1612,11 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
-    ABSENT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if absent_cache() == 2 {
+        absent_remapped(at, len);
+    } else {
+        ABSENT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     REMAPS[4].fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
