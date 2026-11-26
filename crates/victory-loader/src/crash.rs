@@ -393,7 +393,7 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
 /// 00`, eleven bytes) is stepped over, with an `int3` right after it; any
 /// other instruction at a listed place is left to fault.
 ///
-/// The two above are Grand Theft Auto VI's hang watchdog (image
+/// The two above are the title's hang watchdog (image
 /// b99f876b74d4a77f): a thread that sleeps a second and then looks at up to
 /// 64 groups of 8 heartbeat stamps, and crashes on purpose when one is 300
 /// seconds old or more (at +0x2215c35, after calling its fatal hook, which
