@@ -7983,16 +7983,27 @@ impl<'a> Lower<'a> {
         // SDWA: the word written, the other one kept (preserve) or zero
         // (pad; a sign extension above the high word adds nothing).
         let mut keep = true;
+        let mut sext = false;
         if let Some(sd) = v.sdwa {
+            static SEXT16: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let sext_on = *SEXT16.get_or_init(|| std::env::var_os("VICTORY_SDWA_SEXT_16").is_some_and(|v| v == "1"));
             match (sd.dst_sel, sd.dst_unused) {
                 (4, 2) => {}
                 (5, 2) => high = true,
+                (4 | 6, 1) if sext_on => (keep, sext) = (false, true),
                 (4 | 6, _) => keep = false,
                 (5, _) => (high, keep) = (true, false),
                 _ => return Err("an SDWA destination of a 16-bit operation"),
             }
         }
         let c = self.cur;
+        if sext {
+            let k16 = self.s.m.i32(16);
+            let shifted = self.s.m.bin(c, Bin::Shl, x, k16);
+            let r = self.s.m.bin(c, Bin::AShr, shifted, k16);
+            self.write_placed(inst, Reg::V(reg), r, guard);
+            return Ok(());
+        }
         let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
             Some(Ok(o)) if keep => o,
             _ => self.s.m.i32(0),

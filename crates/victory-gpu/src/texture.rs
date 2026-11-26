@@ -141,6 +141,8 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// True when the last hash check saw new bytes (`fxceless/victory-fork#602`).
+    changing: bool,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -1050,10 +1052,12 @@ impl Staging {
                 waited(1, || crate::watch::asking_for(crate::watch::Asker::Texture, || crate::watch::writes(start, start + size, true)))
         {
             const HASH_EVERY: u64 = 8;
+            static CHANGING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let check_changing = *CHANGING.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CHANGING").is_some_and(|v| v == "1"));
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn {
+            if unwritten && !turn && !(check_changing && last.changing) {
                 return 0;
             }
         }
@@ -1118,9 +1122,11 @@ impl Staging {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
+                    last.changing = false;
                     return size;
                 }
                 last.hash = Some(hash);
+                last.changing = true;
                 self.detile(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -1133,9 +1139,11 @@ impl Staging {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
+                    last.changing = false;
                     return size;
                 }
                 last.hash = Some(hash);
+                last.changing = true;
                 self.detile(read);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -1149,9 +1157,11 @@ impl Staging {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
+            last.changing = false;
             return size;
         }
         last.hash = Some(hash);
+        last.changing = true;
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);

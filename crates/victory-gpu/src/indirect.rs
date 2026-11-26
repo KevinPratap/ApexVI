@@ -140,9 +140,15 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         // Ahead of its draw, a record over the most a dispatch runs is a
         // slot the title has not filled (the title leaves all
         // ones there): empty, and not counted below either.
+#ifdef ZERO_GARBAGE
+        if (any(g > uint3(65535u, 1u, 1u))) {
+            g = uint3(0, 0, 0);
+        }
+#else
         if (ahead && g.x > 65535u) {
             g = uint3(0, 0, 0);
         }
+#endif
         asked = g.x;
         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128u;
@@ -175,7 +181,13 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             for (uint j = 0; j < n; j++) {
                 uint c = costs[j];
                 if (c > 0 && next < BUDGET) {
+#ifdef ZERO_GARBAGE
+                    if (BUDGET - next >= c) {
+                        next += c;
+                    }
+#else
                     next = (BUDGET - next <= c) ? BUDGET : (next + c);
+#endif
                 }
             }
             if (next == before) break;
@@ -190,7 +202,13 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             uint fit = 1;
             if (c > 0) {
                 fit = (at < BUDGET && BUDGET - at >= c) ? 1u : 0u;
+#ifdef ZERO_GARBAGE
+                if (fit != 0) {
+                    at += c;
+                }
+#else
                 at = (at >= BUDGET || BUDGET - at <= c) ? BUDGET : (at + c);
+#endif
             }
             fits[k] = fit;
         }
@@ -262,6 +280,11 @@ fn make() -> windows::core::Result<Clamp> {
 }
 
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+    if std::env::var_os("VICTORY_INDIRECT_ZERO_GARBAGE").is_some_and(|v| v == "1") {
+        tracing::info!("indirect clamp zeros oversized mesh records without charging remaining budget (VICTORY_INDIRECT_ZERO_GARBAGE=1)");
+        let patched = format!("#define ZERO_GARBAGE 1\n{SOURCE}");
+        return make_from(device, &patched);
+    }
     make_from(device, SOURCE)
 }
 
