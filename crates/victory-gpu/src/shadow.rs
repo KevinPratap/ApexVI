@@ -1892,11 +1892,50 @@ fn merge_gap() -> usize {
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
 pub(crate) fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
-    let n = now.len().min(was.len());
     let mut runs = Vec::new();
+    changed_runs_into(now, was, &mut runs);
+    runs
+}
+
+/// Whether the masked merge reuses its lists (`VICTORY_MERGE_BUFFERS=1`; off
+/// by default): the changed runs of a page into a buffer of the thread's,
+/// its dwords straight onto the notes, the notes started with the last
+/// submission's room, and equal bytes compared eight at a time as words.
+/// Run batch26's profile: the merge beside flights (`card_masked` and what
+/// it calls) took about 22 ms a frame of the submitting thread, 4.3 of it in
+/// reallocations.
+pub(crate) fn merge_buffers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MERGE_BUFFERS").is_some_and(|v| v == "1"))
+}
+
+thread_local! {
+    /// [`merge_buffers`]: the changed runs of the page being merged.
+    static RUNS: std::cell::RefCell<Vec<(usize, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// [`changed_runs`], appended to `runs`.
+pub(crate) fn changed_runs_into(now: &[u8], was: &[u8], runs: &mut Vec<(usize, usize)>) {
+    let n = now.len().min(was.len());
+    let words = merge_buffers();
     let mut i = 0;
     while i < n {
         // Equal bytes, eight at a time while they last.
+        if words {
+            while i + 8 <= n {
+                // SAFETY: eight bytes of each slice from `i` (`i + 8 <= n`).
+                let (a, b) = unsafe {
+                    (
+                        now.as_ptr().add(i).cast::<u64>().read_unaligned(),
+                        was.as_ptr().add(i).cast::<u64>().read_unaligned(),
+                    )
+                };
+                if a != b {
+                    break;
+                }
+                i += 8;
+            }
+        }
         while i + 8 <= n && now[i..i + 8] == was[i..i + 8] {
             i += 8;
         }
@@ -1912,7 +1951,6 @@ pub(crate) fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
         }
         runs.push((first, i - first));
     }
-    runs
 }
 
 #[cfg(test)]
@@ -3186,6 +3224,29 @@ impl Shadow {
         };
         if crate::host::host().and_then(|h| crate::card_mask::program(&h.device)).is_none() {
             return false;
+        }
+        if merge_buffers() {
+            // The runs into a buffer of this thread's, the dwords straight
+            // onto the notes: no lists made and dropped per page.
+            return RUNS.with(|runs| {
+                let mut runs = runs.borrow_mut();
+                runs.clear();
+                changed_runs_into(title, held, &mut runs);
+                let mut notes = card.masked.lock().unwrap_or_else(|e| e.into_inner());
+                let masked = &mut notes.pending;
+                let before = masked.len();
+                crate::card_mask::dword_masks_into(at, &runs, masked);
+                if masked.len() > crate::card_mask::MOST {
+                    masked.truncate(before);
+                    return false;
+                }
+                for &(r, m) in runs.iter() {
+                    held[r..r + m].copy_from_slice(&title[r..r + m]);
+                    MERGED[1].fetch_add(1, Ordering::Relaxed);
+                    MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                }
+                true
+            });
         }
         let runs = changed_runs(title, held);
         let entries = crate::card_mask::dword_masks(at, &runs);

@@ -28,6 +28,12 @@ pub(crate) fn on() -> bool {
 /// of 0xff for each changed byte, in order.
 pub(crate) fn dword_masks(at: usize, runs: &[(usize, usize)]) -> Vec<(u32, u32)> {
     let mut out: Vec<(u32, u32)> = Vec::new();
+    dword_masks_into(at, runs, &mut out);
+    out
+}
+
+/// [`dword_masks`], appended to `out`.
+pub(crate) fn dword_masks_into(at: usize, runs: &[(usize, usize)], out: &mut Vec<(u32, u32)>) {
     for &(r, n) in runs {
         // a dword at a time, not a byte at a time
         let (mut byte, end) = (at + r, at + r + n);
@@ -45,7 +51,6 @@ pub(crate) fn dword_masks(at: usize, runs: &[(usize, usize)]) -> Vec<(u32, u32)>
             byte = upto;
         }
     }
-    out
 }
 
 /// The bytes the entries put, as runs (offsets), touching ones joined: for
@@ -119,7 +124,11 @@ impl Notes {
     /// kept as a group, and the groups every fetch still to merge came after
     /// go.
     pub(crate) fn send(&mut self, sent_as: u64, fetched: u64) -> Vec<(u32, u32)> {
-        let pending = std::mem::take(&mut self.pending);
+        // With `merge_buffers`: the next submission's notes start with room
+        // for as many as this one's (taken whole, they grew from nothing
+        // again every submission, reallocating as they went).
+        let room = if crate::shadow::merge_buffers() { self.pending.len() } else { 0 };
+        let pending = std::mem::replace(&mut self.pending, Vec::with_capacity(room));
         self.sent.retain(|g| g.0 > fetched);
         if !pending.is_empty() {
             self.sent.push((sent_as, Group::Taken(pending.clone())));
