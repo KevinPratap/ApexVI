@@ -42,9 +42,7 @@ Each change is opt-in behind a `VICTORY_*` switch, described where it is read;
 - **The UI plane is shown**: a Series S title presents its UI (menus, loading
   art, HUD) in a second `PresentX` plane; it is drawn over the scene in the
   present's own list (from upstream #1997 / Yaekai's #211).
-- **Textures fit a 6 GB card**: host copies leave off their top levels
-  (`VICTORY_TEXTURE_MIP_DROP=2`, `_FLOOR=128`, `_COLOR=1`; after upstream
-  #2146): about 4,000 textures wait instead of 12,000, and rooms render.
+- **Textures fit a 6 GB card cleanly**: partly streamed placed textures take D3D12 Tier-2 tiles level by level (`VICTORY_LEVELS_ON_DEMAND=1`, `VICTORY_LEVELS_MIN_KB=64`) so unmapped or neighbor-packed top mips are never detiled or sampled; committed textures cap only 2K/4K mips down to 1024 (`VICTORY_TEXTURE_MIP_DROP=3`, `_CAP=1024`, `_FLOOR=256`, after upstream #2146) while keeping 1024 and smaller textures and uncompressed `Load()` masks whole.
 - **The card waits for less**: masked merges with an index
   (`VICTORY_MERGE_MASKED`, `_INDEX`), copies of GPU results made after their
   flight lands (`VICTORY_COPY_AFTER_LANDING`), false-positive reads let ahead

@@ -6,6 +6,7 @@ param(
     [Parameter(Mandatory)][string]$Game,
     [string]$Cache = "$PSScriptRoot\..\cache",
     [string]$Data = "$PSScriptRoot\..\data",
+    [string]$FidelityFx = $env:VICTORY_FIDELITYFX_DIR,
     [switch]$Safe,
     [ValidateSet('diag', 'release')][string]$Build = 'diag'
 )
@@ -23,8 +24,9 @@ $settings = @{
     VICTORY_INDIRECT_WINDOW = '1'; VICTORY_WIDE_MERGE = '1'
     # light
     VICTORY_AMBIENT = '0.6'; VICTORY_AMBIENT_REFLECT = '0.5'; VICTORY_AMBIENT_SKY = '1'
-    # textures that fit a 6-8 GB card
-    VICTORY_TEXTURE_MIP_DROP = '2'; VICTORY_TEXTURE_MIP_DROP_FLOOR = '128'; VICTORY_TEXTURE_MIP_DROP_COLOR = '1'
+    # textures that fit a 6-8 GB card without blurring close-ups or shrinking Load() masks
+    VICTORY_LEVELS_ON_DEMAND = '1'; VICTORY_LEVELS_MIN_KB = '64'
+    VICTORY_TEXTURE_MIP_DROP = '3'; VICTORY_TEXTURE_MIP_CAP = '1024'; VICTORY_TEXTURE_MIP_DROP_FLOOR = '256'
     VICTORY_DETILE_ZERO = '1'
     # stability
     VICTORY_STEP_OVER = '2215c35,23cf683'
@@ -44,6 +46,10 @@ $newest = @{
     VICTORY_INDIRECT_ZERO_GARBAGE = '1'; VICTORY_SDWA_SEXT_16 = '1'; VICTORY_SYNC_BARRIER = '1'
     VICTORY_TEXTURE_CHANGING = '1'; VICTORY_PAGE_WRITES = 'all'; VICTORY_SPATIAL_NO_JITTER = '1'
     VICTORY_PREP_SPLIT = '2'; VICTORY_PARALLEL_REFRESH = '1'; VICTORY_SECTION_MB = '2'
+}
+if ($FidelityFx -and (Test-Path (Join-Path $FidelityFx 'amd_fidelityfx_upscaler_dx12.dll'))) {
+    $settings['VICTORY_FIDELITYFX_DIR'] = (Resolve-Path $FidelityFx).Path
+    $settings['VICTORY_UPSCALER'] = 'amd'
 }
 if (-not $Safe) { foreach ($k in $newest.Keys) { $settings[$k] = $newest[$k] } }
 
