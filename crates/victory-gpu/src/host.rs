@@ -7438,6 +7438,8 @@ impl HostList {
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
+                    } else {
+                        batch.check_textures();
                     }
                     work();
                     // It wrote title memory, where is not known here: the
