@@ -1098,6 +1098,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             open = block >= uncommitted_until;
             if open {
                 g.absent.remove(&block);
+                ABSENT_COUNTS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
         if open {
@@ -1297,20 +1298,26 @@ fn uncommitted_end(block: usize) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         let at = ABSENT_EPOCH.load(Relaxed);
         let mut cache = ABSENT.lock().unwrap_or_else(|e| e.into_inner());
-        if cache.0 != at {
+        if cache.0 != at && absent_cache() == 4 {
+            // Mode 4: entries live past submissions, each until its age
+            // (below) or a remap over it.
+            cache.0 = at;
+        } else if cache.0 != at {
             cache.0 = at;
             if absent_cache() == 3 {
                 // Mode 3: a placeholder region gains pages only by a mapping
                 // the runtime announces (which drops it); the title's own
                 // reserved memory may be committed with no word, and is
                 // asked about again.
-                cache.1.retain(|_, &mut (_, mapped)| mapped);
+                cache.1.retain(|_, &mut (_, mapped, _)| mapped);
             } else {
                 cache.1.clear();
             }
         }
-        if let Some((_, &(end, _))) = cache.1.range(..=block).next_back()
+        let now = absent_now_ms();
+        if let Some((_, &(end, _, stamp))) = cache.1.range(..=block).next_back()
             && end > block
+            && (absent_cache() != 4 || now.saturating_sub(stamp) < absent_ms())
         {
             ABSENT_COUNTS[0].fetch_add(1, Relaxed);
             return end;
@@ -1327,7 +1334,7 @@ fn uncommitted_end(block: usize) -> usize {
                 // Mode 2 and 3: under the region's first block, so that every
                 // block of it finds the answer (mode 1: under the block asked
                 // about).
-                cache.1.insert(if absent_cache() >= 2 { base } else { block }, (end, mapped));
+                cache.1.insert(if absent_cache() >= 2 { base } else { block }, (end, mapped, now));
             }
         }
         return end;
@@ -1337,7 +1344,22 @@ fn uncommitted_end(block: usize) -> usize {
 
 /// With [`absent_cache`]: since the last line, regions answered from the
 /// cache, asked of Windows, and of those asked the placeholders of views.
-static ABSENT_COUNTS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+static ABSENT_COUNTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// With [`absent_cache`] 4: how long an absent region stands without being
+/// asked about again, `VICTORY_GUARD_ABSENT_MS` (10 to 10,000; 250 by default).
+fn absent_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("VICTORY_GUARD_ABSENT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(250, |m| m.clamp(10, 10_000))
+    })
+}
+
+/// Milliseconds since the first call, for [`absent_cache`]'s ages.
+fn absent_now_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
 
 /// With the frame line, when [`absent_cache`] is on: what the guards' looks
 /// at absent memory came to per frame over `frames`.
@@ -1345,13 +1367,15 @@ pub(crate) fn absent_line(frames: f64) {
     if absent_cache() == 0 {
         return;
     }
-    let [hits, asked, mapped] = [0, 1, 2].map(|i| ABSENT_COUNTS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    let [hits, asked, mapped, committed] =
+        [0, 1, 2, 3].map(|i| ABSENT_COUNTS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
     if hits + asked == 0.0 {
         return;
     }
     tracing::info!(
         "absent memory the guards looked at, per frame (VICTORY_GUARD_ABSENT_CACHE={}): {hits:.0} answered from the cache, \
-         {asked:.0} asked of Windows ({mapped:.0} of them placeholders of views)",
+         {asked:.0} asked of Windows ({mapped:.0} of them placeholders of views); absent blocks found committed at a look: \
+         {committed:.1}",
         absent_cache()
     );
 }
@@ -1367,7 +1391,7 @@ fn absent_remapped(at: usize, len: usize) {
         .rev()
         // The regions do not overlap: below the first that ends before
         // `first`, none reaches it.
-        .take_while(|&(_, &(end, _))| end > first)
+        .take_while(|&(_, &(end, _, _))| end > first)
         .map(|(&start, _)| start)
         .collect();
     for start in gone {
@@ -1392,7 +1416,11 @@ fn absent_remapped(at: usize, len: usize) {
 /// calls placeholders of views (the page pool, whose askings walk gigabytes
 /// of pages) stay cached past each submission's asking, until a mapping the
 /// runtime announces over them; the title's own reserved memory is asked
-/// about again at each. Run batch26: mode 1 still left 11.5
+/// about again at each (an unmapped placeholder reports itself private, so
+/// this keeps little: run batch29). `=4`: as 2, and no region is asked about
+/// again at a submission's asking, only once it is older than
+/// `VICTORY_GUARD_ABSENT_MS` (250 by default) or a remap is announced over
+/// it: a commit with no word is seen within that time. Run batch26: mode 1 still left 11.5
 /// ms a frame of VirtualQuery, the regions kept under the block first asked
 /// about and every announced mapping (about 17 a frame) emptying them all.
 fn absent_cache() -> u8 {
@@ -1401,6 +1429,7 @@ fn absent_cache() -> u8 {
         Ok("1") => 1,
         Ok("2") => 2,
         Ok("3") => 3,
+        Ok("4") => 4,
         _ => 0,
     })
 }
@@ -1408,7 +1437,7 @@ fn absent_cache() -> u8 {
 /// [`absent_cache`]: the time the regions below stand for, and those
 /// regions (first block, end block) found uncommitted in it.
 static ABSENT_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static ABSENT: Mutex<(u64, BTreeMap<usize, (usize, bool)>)> = Mutex::new((0, BTreeMap::new()));
+static ABSENT: Mutex<(u64, BTreeMap<usize, (usize, bool, u64)>)> = Mutex::new((0, BTreeMap::new()));
 
 /// The uncommitted region holding `block`: its first block, its end, and
 /// whether Windows says it is a placeholder of views (mapped); or
