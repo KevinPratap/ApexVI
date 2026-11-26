@@ -16,7 +16,7 @@ Tested on one machine: Windows 11, RTX 4050 Laptop (6 GB), Intel i7-12650H,
 
 | | |
 |---|---|
-| Menus, loading screens, account picker | visible (the UI plane is composed, see below), 30 fps |
+| Menus, loading screens, account picker | visible and sharp (the UI plane is composed; UI and loading art kept at full size), 30 fps |
 | Opening and the first room | lit and textured, the in-game hints show |
 | Frame rate in the world | **about 7.5 fps** (133 ms a frame), from 4.8 (210 ms) at the start of this fork |
 | Stability | 8-10 minute scripted runs with no crash or device loss; the title's own hang watchdog is stepped over |
@@ -60,6 +60,7 @@ Each change is opt-in behind a `VICTORY_*` switch, described where it is read;
   (`VICTORY_MERGE_BUFFERS`, `VICTORY_MERGE_CHUNKS`).
 - **Light**: the ambient stand-in with reflections held and the sky followed
   (`VICTORY_AMBIENT_REFLECT`, `VICTORY_AMBIENT_SKY`, from Belobug's fork).
+- **UI and loading art at full size** while world textures shrink (`VICTORY_TEXTURE_MIP_DROP_UI_FULL=2`: what a draw into a presented image samples is kept whole), and **no black blink** while a new picture uploads (`VICTORY_KEEP_SHOWN`, `VICTORY_SHOW_AFTER`, after the VIctory-7900XTX fork).
 - **Stability**: the title's hang watchdog stepped over with a log of the
   stale heartbeat (`VICTORY_STEP_OVER`); four 64-lane programs the 32-lane host
   refused translated with wave-wide branches (`VICTORY_WAVE_WIDE_ONLY`).
