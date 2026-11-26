@@ -2555,11 +2555,39 @@ mod relay_tests {
 /// descriptor slots, upload
 /// memory and scratch chunks are held until then, and a frame's lists held
 /// all at once ran the slots out before (run 45).
+/// Whether the flight-list and merge-run budgets are widened (`2x`
+/// `VICTORY_LATE_WAIT_LISTS`, `8x` `VICTORY_MERGE_RUNS`) to prevent flight
+/// settles (`VICTORY_SETTLE_ROOM=1`, `=alt` 20 s on/off; off by default).
+/// Ported from `fxceless/victory-fork` `06702fe86` (by `fxceless`).
+fn settle_room() -> bool {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_SETTLE_ROOM").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = (now_us() / 20_000_000) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "wider flight-list and merge-run budgets from now (VICTORY_SETTLE_ROOM=alt): {}",
+                    if on { "ON" } else { "off, as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
 fn late_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
-    *MOST.get_or_init(|| {
+    let most = *MOST.get_or_init(|| {
         std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256).max(1)
-    })
+    });
+    if settle_room() { most.saturating_mul(2) } else { most }
 }
 
 /// Whether a submission with bottom-of-pipe writes may fly
@@ -3452,9 +3480,12 @@ fn stale_under_flights(runs: &[&HostList], wide: bool) -> bool {
         // runs a frame of a few bytes each, and the cap of 512 settled the
         // flights twice a frame, 50 ms of the submitting thread.)
         static RUNS: OnceLock<usize> = OnceLock::new();
-        let cap = *RUNS.get_or_init(|| {
+        let mut cap = *RUNS.get_or_init(|| {
             std::env::var("VICTORY_MERGE_RUNS").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(512, |n| n.clamp(1, 1 << 16))
         });
+        if settle_room() {
+            cap = (cap.saturating_mul(8)).min(1 << 16);
+        }
         let runs_left = std::sync::atomic::AtomicUsize::new(cap);
         if wide && spans.len() >= 2 {
             spans.sort_unstable_by_key(|s| std::cmp::Reverse(s.2 - s.1));
