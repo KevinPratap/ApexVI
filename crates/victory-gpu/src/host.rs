@@ -2909,6 +2909,20 @@ mod fill_ahead {
         hot.as_ref().is_some_and(|set| set.range(src / PIECE..=(src + len - 1) / PIECE).next().is_some())
     }
 
+    /// Makes the 64 KiB pieces of `[from, to)` wait ([`hot`]): the number of
+    /// pieces that wait, if this added one.
+    fn mark_hot(from: usize, to: usize) -> Option<u64> {
+        let mut hot = HOT.lock().unwrap_or_else(|e| e.into_inner());
+        let set = hot.get_or_insert_with(Default::default);
+        let mut added = 0;
+        for piece in from / PIECE..=(to.max(from + 1) - 1) / PIECE {
+            if set.insert(piece) {
+                added += 1;
+            }
+        }
+        (added > 0).then(|| HOT_COUNT.fetch_add(added, Relaxed) + added)
+    }
+
     pub(super) fn on() -> bool {
         fills_ahead() && !WAIT.load(Relaxed)
     }
@@ -3017,17 +3031,22 @@ mod fill_ahead {
             }
             let n = COUNT[2].fetch_add(1, Relaxed) + 1;
             let first = now.iter().zip(&new[a - at..b - at]).position(|(x, y)| x != y).unwrap_or(0);
-            if local() {
-                let mut hot = HOT.lock().unwrap_or_else(|e| e.into_inner());
-                let set = hot.get_or_insert_with(Default::default);
-                let mut added = 0;
-                for piece in from / PIECE..=(to - 1) / PIECE {
-                    if set.insert(piece) {
-                        added += 1;
-                    }
+            // With `VICTORY_COPY_AHEAD`: a copy's miss makes only the pieces
+            // it read wait for copies; the other copies go on ahead.
+            if copy && copy_ahead() {
+                if let Some(pieces) = mark_hot(from, to)
+                    && pieces <= 64
+                {
+                    tracing::warn!(
+                        "a title buffer copy read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders                          changed them (first at {:#x}, landed in frame {frame}): the lists of that submission drew with the                          bytes from before. Copies that read its 64 KiB wait for flights from here on, the others not                          (VICTORY_COPY_AHEAD=1; {pieces} pieces wait, {n} such reads)",
+                        to - from,
+                        a + first
+                    );
                 }
-                if added > 0 {
-                    let pieces = HOT_COUNT.fetch_add(added, Relaxed) + added;
+                continue;
+            }
+            if local() {
+                if let Some(pieces) = mark_hot(from, to) {
                     if pieces <= 64 {
                         tracing::warn!(
                             "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders \
