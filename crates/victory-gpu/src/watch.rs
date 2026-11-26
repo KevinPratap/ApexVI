@@ -1294,29 +1294,66 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.
 fn uncommitted_end(block: usize) -> usize {
     if absent_cache() != 0 {
-        let at = ABSENT_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+        use std::sync::atomic::Ordering::Relaxed;
+        let at = ABSENT_EPOCH.load(Relaxed);
         let mut cache = ABSENT.lock().unwrap_or_else(|e| e.into_inner());
         if cache.0 != at {
-            *cache = (at, BTreeMap::new());
+            cache.0 = at;
+            if absent_cache() == 3 {
+                // Mode 3: a placeholder region gains pages only by a mapping
+                // the runtime announces (which drops it); the title's own
+                // reserved memory may be committed with no word, and is
+                // asked about again.
+                cache.1.retain(|_, &mut (_, mapped)| mapped);
+            } else {
+                cache.1.clear();
+            }
         }
-        if let Some((_, &end)) = cache.1.range(..=block).next_back()
+        if let Some((_, &(end, _))) = cache.1.range(..=block).next_back()
             && end > block
         {
+            ABSENT_COUNTS[0].fetch_add(1, Relaxed);
             return end;
         }
         drop(cache);
-        let (base, end) = uncommitted_region(block);
+        let (base, end, mapped) = uncommitted_region(block);
+        ABSENT_COUNTS[1].fetch_add(1, Relaxed);
+        if mapped {
+            ABSENT_COUNTS[2].fetch_add(1, Relaxed);
+        }
         if end > block {
             let mut cache = ABSENT.lock().unwrap_or_else(|e| e.into_inner());
             if cache.0 == at {
-                // Mode 2: under the region's first block, so that every block
-                // of it finds the answer (mode 1: under the block asked about).
-                cache.1.insert(if absent_cache() == 2 { base } else { block }, end);
+                // Mode 2 and 3: under the region's first block, so that every
+                // block of it finds the answer (mode 1: under the block asked
+                // about).
+                cache.1.insert(if absent_cache() >= 2 { base } else { block }, (end, mapped));
             }
         }
         return end;
     }
     uncommitted_region(block).1
+}
+
+/// With [`absent_cache`]: since the last line, regions answered from the
+/// cache, asked of Windows, and of those asked the placeholders of views.
+static ABSENT_COUNTS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// With the frame line, when [`absent_cache`] is on: what the guards' looks
+/// at absent memory came to per frame over `frames`.
+pub(crate) fn absent_line(frames: f64) {
+    if absent_cache() == 0 {
+        return;
+    }
+    let [hits, asked, mapped] = [0, 1, 2].map(|i| ABSENT_COUNTS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    if hits + asked == 0.0 {
+        return;
+    }
+    tracing::info!(
+        "absent memory the guards looked at, per frame (VICTORY_GUARD_ABSENT_CACHE={}): {hits:.0} answered from the cache, \
+         {asked:.0} asked of Windows ({mapped:.0} of them placeholders of views)",
+        absent_cache()
+    );
 }
 
 /// With [`absent_cache`] 2: a mapping the runtime announces over
@@ -1330,7 +1367,7 @@ fn absent_remapped(at: usize, len: usize) {
         .rev()
         // The regions do not overlap: below the first that ends before
         // `first`, none reaches it.
-        .take_while(|&(_, &end)| end > first)
+        .take_while(|&(_, &(end, _))| end > first)
         .map(|(&start, _)| start)
         .collect();
     for start in gone {
@@ -1351,7 +1388,11 @@ fn absent_remapped(at: usize, len: usize) {
 ///
 /// `VICTORY_GUARD_ABSENT_CACHE=2`: each region kept under its first block
 /// (any block of it then finds it), and a mapping the runtime announces
-/// drops only the regions it touches. Run batch26: mode 1 still left 11.5
+/// drops only the regions it touches. `=3`: as 2, and the regions Windows
+/// calls placeholders of views (the page pool, whose askings walk gigabytes
+/// of pages) stay cached past each submission's asking, until a mapping the
+/// runtime announces over them; the title's own reserved memory is asked
+/// about again at each. Run batch26: mode 1 still left 11.5
 /// ms a frame of VirtualQuery, the regions kept under the block first asked
 /// about and every announced mapping (about 17 a frame) emptying them all.
 fn absent_cache() -> u8 {
@@ -1359,6 +1400,7 @@ fn absent_cache() -> u8 {
     *MODE.get_or_init(|| match std::env::var("VICTORY_GUARD_ABSENT_CACHE").as_deref() {
         Ok("1") => 1,
         Ok("2") => 2,
+        Ok("3") => 3,
         _ => 0,
     })
 }
@@ -1366,13 +1408,14 @@ fn absent_cache() -> u8 {
 /// [`absent_cache`]: the time the regions below stand for, and those
 /// regions (first block, end block) found uncommitted in it.
 static ABSENT_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static ABSENT: Mutex<(u64, BTreeMap<usize, usize>)> = Mutex::new((0, BTreeMap::new()));
+static ABSENT: Mutex<(u64, BTreeMap<usize, (usize, bool)>)> = Mutex::new((0, BTreeMap::new()));
 
-/// The uncommitted region holding `block`: its first block and its end, or
-/// `(block, block)` if `block` is committed.
-fn uncommitted_region(block: usize) -> (usize, usize) {
+/// The uncommitted region holding `block`: its first block, its end, and
+/// whether Windows says it is a placeholder of views (mapped); or
+/// `(block, block, false)` if `block` is committed.
+fn uncommitted_region(block: usize) -> (usize, usize, bool) {
     use windows_sys::Win32::System::Memory::{
-        MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        MEM_FREE, MEM_MAPPED, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -1380,9 +1423,9 @@ fn uncommitted_region(block: usize) -> (usize, usize) {
     let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
     if n != 0 && matches!(info.State, MEM_RESERVE | MEM_FREE) {
         let end = (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK;
-        ((info.BaseAddress as usize / BLOCK).min(block), end)
+        ((info.BaseAddress as usize / BLOCK).min(block), end, info.Type == MEM_MAPPED)
     } else {
-        (block, block)
+        (block, block, false)
     }
 }
 
@@ -1612,7 +1655,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
-    if absent_cache() == 2 {
+    if absent_cache() >= 2 {
         absent_remapped(at, len);
     } else {
         ABSENT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
