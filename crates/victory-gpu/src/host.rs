@@ -221,9 +221,46 @@ pub(crate) fn submissions_started() -> u64 {
 /// before). The mirroring takes none of the locks the submitting thread
 /// holds while it waits for the join (`submitted` above all: the
 /// descriptor code never settles, executes or submits).
+/// `VICTORY_PREP_SPLIT=1`: a submission's heap mirroring on a kept thread
+/// beside its copies' preparing (A1). `=2`: also spreads per-copy merges
+/// under shader writes across the kept threads (A2). `=alt` / `=alt2`:
+/// twenty seconds on (`1` or `2`), twenty off (`0`), in turn, logged on
+/// each flip so one run A/Bs the same scene.
+fn prep_split_mode() -> u8 {
+    /// 0 off, 1 = A1, 2 = A1+A2, 3 = alt (0/1), 4 = alt2 (0/2).
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_PREP_SPLIT").ok().as_deref().map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
+        Some("alt") => 3,
+        Some("alt2") => 4,
+        _ => 0,
+    })
+}
+
+pub(crate) fn prep_split_configured() -> bool {
+    prep_split_mode() != 0
+}
+
 pub(crate) fn prep_split() -> u8 {
-    static LEVEL: OnceLock<u8> = OnceLock::new();
-    *LEVEL.get_or_init(|| std::env::var("VICTORY_PREP_SPLIT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+    match prep_split_mode() {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        m => {
+            let target = if m == 4 { 2u8 } else { 1u8 };
+            let level = if (now_us() / 20_000_000) % 2 == 1 { target } else { 0 };
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(255);
+            if LAST.swap(level, Ordering::Relaxed) != level {
+                tracing::info!(
+                    "submission preparation split from now (VICTORY_PREP_SPLIT={}): {}",
+                    if m == 4 { "alt2" } else { "alt" },
+                    if level > 0 { format!("ON (level {level})") } else { "off, as usual".into() }
+                );
+            }
+            level
+        }
+    }
 }
 
 /// With [`prep_split`]: microseconds the submitting thread waited at the
@@ -2518,11 +2555,39 @@ mod relay_tests {
 /// descriptor slots, upload
 /// memory and scratch chunks are held until then, and a frame's lists held
 /// all at once ran the slots out before (run 45).
+/// Whether the flight-list and merge-run budgets are widened (`2x`
+/// `VICTORY_LATE_WAIT_LISTS`, `8x` `VICTORY_MERGE_RUNS`) to prevent flight
+/// settles (`VICTORY_SETTLE_ROOM=1`, `=alt` 20 s on/off; off by default).
+/// Ported from `fxceless/victory-fork` `06702fe86` (by `fxceless`).
+fn settle_room() -> bool {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_SETTLE_ROOM").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = (now_us() / 20_000_000) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "wider flight-list and merge-run budgets from now (VICTORY_SETTLE_ROOM=alt): {}",
+                    if on { "ON" } else { "off, as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
 fn late_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
-    *MOST.get_or_init(|| {
+    let most = *MOST.get_or_init(|| {
         std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256).max(1)
-    })
+    });
+    if settle_room() { most.saturating_mul(2) } else { most }
 }
 
 /// Whether a submission with bottom-of-pipe writes may fly
@@ -3389,7 +3454,7 @@ mod fill_check {
 /// may write and that the title wrote since it was last copied. The
 /// refresh leaves ranges shaders are writing alone (`Shadow::update`), so
 /// the title's bytes there would reach the card a submission late.
-fn stale_under_flights(runs: &[&HostList]) -> bool {
+fn stale_under_flights(runs: &[&HostList], wide: bool) -> bool {
     use std::sync::Arc;
     // Per copy, the span of what is refreshed (a flush brings that much
     // up to date at most).
@@ -3415,10 +3480,34 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         // runs a frame of a few bytes each, and the cap of 512 settled the
         // flights twice a frame, 50 ms of the submitting thread.)
         static RUNS: OnceLock<usize> = OnceLock::new();
-        let mut runs_left = *RUNS.get_or_init(|| {
+        let mut cap = *RUNS.get_or_init(|| {
             std::env::var("VICTORY_MERGE_RUNS").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(512, |n| n.clamp(1, 1 << 16))
         });
-        return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
+        if settle_room() {
+            cap = (cap.saturating_mul(8)).min(1 << 16);
+        }
+        let runs_left = std::sync::atomic::AtomicUsize::new(cap);
+        if wide && spans.len() >= 2 {
+            spans.sort_unstable_by_key(|s| std::cmp::Reverse(s.2 - s.1));
+            let state = Arc::new((runs_left, std::sync::atomic::AtomicBool::new(false)));
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = spans
+                .into_iter()
+                .map(|(shadow, from, to)| {
+                    let state = state.clone();
+                    Box::new(move || {
+                        if state.1.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        if shadow.merge_under_writes(from, to - from, &state.0) {
+                            state.1.store(true, Ordering::Relaxed);
+                        }
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            crate::shadow::wide_run(jobs);
+            return state.1.load(Ordering::Relaxed);
+        }
+        return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &runs_left));
     }
     spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
 }
@@ -5846,7 +5935,8 @@ impl Host {
         // command lists that index those slots are submitted: beside the
         // copies' preparing with `prep_split` (joined below), in place when
         // a sweep is due (it must not run beside or before the mirroring).
-        let heaps = if prep_split() >= 1 && !sweep_due() {
+        let split = prep_split();
+        let heaps = if split >= 1 && !sweep_due() {
             Some(crate::shadow::wide_start(Box::new(crate::descriptor::sync_heaps)))
         } else {
             crate::descriptor::sync_heaps();
@@ -5928,13 +6018,13 @@ impl Host {
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
-            if behind && stale_under_flights(runs) {
+            if behind && stale_under_flights(runs, split >= 2) {
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
                 crate::watch::ask_once(&ranges);
             }
-        } else if behind && stale_under_flights(runs) {
+        } else if behind && stale_under_flights(runs, split >= 2) {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
@@ -7381,7 +7471,11 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        if parallel_refresh() {
+                            batch.due_textures.push(staging.clone());
+                        } else {
+                            staging.refresh();
+                        }
                     }
                     continue;
                 }
@@ -7407,6 +7501,32 @@ impl HostList {
 fn wide_refresh() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
+}
+
+/// Whether a submission's staged-texture checks run across the kept wide
+/// threads (`VICTORY_PARALLEL_REFRESH=1`, `=alt` 20 s on/off; off by default).
+/// Ported from `fxceless/victory-fork` `ceb9e1f7a` (by `fxceless`).
+fn parallel_refresh() -> bool {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_PARALLEL_REFRESH").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = (now_us() / 20_000_000) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "parallel texture refreshes from now (VICTORY_PARALLEL_REFRESH=alt): {}",
+                    if on { "ON" } else { "off, as usual" }
+                );
+            }
+            on
+        }
+    }
 }
 
 // flush spreads its refreshes over the wide threads, biggest first, from two copies (VICTORY_FLUSH_WIDE=1)
@@ -7495,6 +7615,8 @@ struct Batch {
     current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// Staged textures queued for parallel refresh ([`parallel_refresh`]).
+    due_textures: Vec<std::sync::Arc<crate::texture::Staging>>,
 }
 
 impl Batch {
@@ -7612,7 +7734,34 @@ impl Batch {
         });
     }
 
+    fn check_textures(&mut self) {
+        if self.due_textures.is_empty() {
+            return;
+        }
+        if self.due_textures.len() == 1 {
+            if let Some(staging) = self.due_textures.pop() {
+                staging.refresh();
+            }
+            return;
+        }
+        self.due_textures
+            .sort_unstable_by_key(|s| std::cmp::Reverse(s.memory().1));
+        let started = std::time::Instant::now();
+        let before = PREPARING[2].load(Ordering::Relaxed);
+        let jobs: Vec<Box<dyn FnOnce() + Send>> = self
+            .due_textures
+            .drain(..)
+            .map(|staging| Box::new(move || staging.refresh()) as Box<dyn FnOnce() + Send>)
+            .collect();
+        crate::shadow::wide_run(jobs);
+        let summed = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before);
+        let over = summed.saturating_sub(started.elapsed().as_micros() as u64);
+        PREPARING[2].fetch_sub(over, Ordering::Relaxed);
+        crate::framelog::sub(crate::framelog::T::RefreshUs, over);
+    }
+
     fn flush(&mut self) {
+        self.check_textures();
         self.index.clear();
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
@@ -8355,7 +8504,7 @@ impl Meter {
         crate::watch::rest_line(frames);
         crate::watch::bits_line(frames);
         #[cfg(feature = "diagnostics")]
-        if prep_split() >= 1 {
+        if prep_split_configured() {
             static WAS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let now = HEAPS_JOINED.load(Ordering::Relaxed);
             let waited = now.saturating_sub(WAS.swap(now, Ordering::Relaxed)) as f64 / 1000.0 / frames;

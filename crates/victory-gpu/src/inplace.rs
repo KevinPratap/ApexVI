@@ -722,11 +722,14 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
                 );
                 return None;
             }
-            tracing::info!(
-                section,
-                mb = section_bytes >> 20,
-                "a view of our own on a section of title pages, for what shaders wrote (VICTORY_BACK_OWN_VIEW=1)"
-            );
+            static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                tracing::info!(
+                    section,
+                    mb = section_bytes >> 20,
+                    "a view of our own on a section of title pages, for what shaders wrote (VICTORY_BACK_OWN_VIEW=1)"
+                );
+            }
             Some(Own {
                 base: at.Value as usize,
                 bytes: section_bytes,

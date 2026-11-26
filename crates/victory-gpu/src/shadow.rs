@@ -3227,7 +3227,12 @@ impl Shadow {
     /// Whether the caller must still settle the flights: the journal
     /// cannot say what was written, a snapshot is missing, or `runs_left`
     /// ran out. Pages done before that stay done.
-    pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize) -> bool {
+    pub(crate) fn merge_under_writes(
+        &self,
+        address: usize,
+        len: usize,
+        runs_left: &std::sync::atomic::AtomicUsize,
+    ) -> bool {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -3298,11 +3303,15 @@ impl Shadow {
                         continue;
                     }
                     let runs = joined_over(changed_runs(title, held), merge_gap());
-                    if runs.len() > *runs_left {
+                    if runs_left
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                            left.checked_sub(runs.len())
+                        })
+                        .is_err()
+                    {
                         settle_why(2, start, self.len, runs.len());
                         return true;
                     }
-                    *runs_left -= runs.len();
                     for (r, m) in runs {
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
                         self.card_changed(at + r, at + r + m);
@@ -5126,6 +5135,112 @@ mod card_merge_tests {
         // older card byte is taken for a shader's write.
         let before = land(7);
         assert_eq!(before[title_byte], content[title_byte]);
+    }
+
+    #[test]
+    fn parallel_merge_under_writes_matches_serial_and_enforces_budget() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use windows_sys::Win32::System::Memory as mem;
+
+        let (Some(buffer), Some(staging)) = (warp_buffer(), warp_buffer()) else {
+            return;
+        };
+        const N: usize = 4;
+        const LEN: usize = 16 << 10;
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        unsafe {
+            let base = mem::VirtualAlloc(
+                std::ptr::null(),
+                N * LEN,
+                mem::MEM_RESERVE | mem::MEM_COMMIT | MEM_WRITE_WATCH,
+                mem::PAGE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!base.is_null());
+            let init: Vec<u8> = (0..N * LEN).map(|i| (i * 13 + 7) as u8).collect();
+            std::ptr::copy_nonoverlapping(init.as_ptr(), base, init.len());
+
+            // Clear initial write-watch bits, then dirty two runs in each copy.
+            let _ = crate::watch::writes(base as usize, base as usize + N * LEN, false);
+            for i in 0..N {
+                *base.add(i * LEN + 64) ^= 0x33;
+                *base.add(i * LEN + 8192) ^= 0x77;
+            }
+            crate::watch::ask_once(&[(base as usize, base as usize + N * LEN)]);
+
+            let make_copies = |sides: &mut [Vec<u8>; N]| -> Vec<Arc<Shadow>> {
+                sides
+                    .iter_mut()
+                    .enumerate()
+                    .map(|(i, side)| {
+                        let start = (base as usize + i * LEN) as u64;
+                        let mut s = Shadow::new(buffer.clone(), side.as_mut_ptr(), 0, start, LEN as u64);
+                        s.watched.store(1, Ordering::Relaxed);
+                        s.pending.lock().unwrap().push((start as usize, start as usize + LEN));
+                        s.card = Some(Card {
+                            staging: staging.clone(),
+                            before: Mutex::new(None),
+                            dirty: Mutex::default(),
+                            sent: Mutex::default(),
+                            masked: Mutex::default(),
+                            size: 0,
+                        });
+                        Arc::new(s)
+                    })
+                    .collect()
+            };
+
+            let mut serial_sides: [Vec<u8>; N] = std::array::from_fn(|i| init[i * LEN..(i + 1) * LEN].to_vec());
+            let serial_copies = make_copies(&mut serial_sides);
+            let serial_budget = AtomicUsize::new(64);
+            let serial_settle = serial_copies
+                .iter()
+                .any(|c| c.merge_under_writes(c.start as usize, LEN, &serial_budget));
+            assert!(!serial_settle);
+
+            let mut wide_sides: [Vec<u8>; N] = std::array::from_fn(|i| init[i * LEN..(i + 1) * LEN].to_vec());
+            let wide_copies = make_copies(&mut wide_sides);
+            let state = Arc::new((AtomicUsize::new(64), AtomicBool::new(false)));
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = wide_copies
+                .iter()
+                .map(|c| {
+                    let (c, state) = (c.clone(), state.clone());
+                    Box::new(move || {
+                        if c.merge_under_writes(c.start as usize, LEN, &state.0) {
+                            state.1.store(true, Ordering::Relaxed);
+                        }
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            super::wide_run(jobs);
+            assert!(!state.1.load(Ordering::Relaxed));
+            assert_eq!(wide_sides, serial_sides);
+            assert_eq!(state.0.load(Ordering::Relaxed), serial_budget.load(Ordering::Relaxed));
+
+            // Budget of 3 runs across 4 copies (2 runs each = 8 needed): must ask for a settle and never wrap.
+            let mut tight_sides: [Vec<u8>; N] = std::array::from_fn(|i| init[i * LEN..(i + 1) * LEN].to_vec());
+            let tight_copies = make_copies(&mut tight_sides);
+            let tight = Arc::new((AtomicUsize::new(3), AtomicBool::new(false)));
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = tight_copies
+                .iter()
+                .map(|c| {
+                    let (c, tight) = (c.clone(), tight.clone());
+                    Box::new(move || {
+                        if c.merge_under_writes(c.start as usize, LEN, &tight.0) {
+                            tight.1.store(true, Ordering::Relaxed);
+                        }
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            super::wide_run(jobs);
+            assert!(tight.1.load(Ordering::Relaxed), "exhausted budget must settle");
+            assert!(tight.0.load(Ordering::Relaxed) <= 3);
+
+            crate::watch::ask_once_end();
+            drop((serial_copies, wide_copies, tight_copies));
+            mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
+        }
     }
 }
 

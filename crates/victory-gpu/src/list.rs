@@ -1497,11 +1497,38 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
     let _ = this;
 }
 
+/// Whether console pipeline syncs (`0x408`/`0x410`, or `0x418`/`0x420` on
+/// newer lists) record a host `UAV_BARRIER` (`VICTORY_SYNC_BARRIER=1`).
+/// Ported from `realblastex/flamingo` `a1178ce85`. Off by default.
+#[cfg(windows)]
+fn sync_barrier() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_BARRIER").is_some_and(|v| v == "1"))
+}
+
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
-/// bottom of the pipe `(flags, control, address, size)`. Host lists order
-/// their own work and every submission is waited for, so there is nothing
-/// to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+/// bottom of the pipe `(flags, control, address, size)`. With
+/// `VICTORY_SYNC_BARRIER=1`, orders compute/UAV writes within the same host
+/// list via a `UAV_BARRIER`.
+extern "system" fn sync(this: This, flags: u32, control: u32, _address: u64, _size: u64) {
+    #[cfg(windows)]
+    if sync_barrier()
+        && let Some(list) = host_list(this)
+    {
+        static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 8 {
+            tracing::info!(flags = format_args!("{flags:#x}"), control = format_args!("{control:#x}"), "pipeline sync -> UAV barrier (VICTORY_SYNC_BARRIER=1)");
+        }
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+        // SAFETY: the same layout; no resource named.
+        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+        // SAFETY: an open list.
+        unsafe { list.list.ResourceBarrier(&[barrier]) };
+    }
+    #[cfg(not(windows))]
+    let _ = (this, flags, control);
+}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
