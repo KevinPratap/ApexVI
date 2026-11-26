@@ -2048,11 +2048,23 @@ impl HostHeap {
             // time it got sharper.
             if later
                 && keep_views()
-                && view_at(made[index as usize] as u32, (made[index as usize] >> 32) as u32)
-                    .is_some_and(|old| same_placed_texture(&old, &view))
+                && let Some(old) = view_at(made[index as usize] as u32, (made[index as usize] >> 32) as u32)
             {
-                KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Some(view);
+                if same_placed_texture(&old, &view) {
+                    KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Some(view);
+                }
+                // And of another texture that can stand for it until the
+                // new one is made ([`keep_shown`]): made null, the slot
+                // read as black for as long as it waited.
+                if keep_shown() > 0 && is_texture_view(&old) {
+                    let kin = kin(&old, &view);
+                    let kept = kin.kept(keep_shown());
+                    rewritten(kin, kept);
+                    if kept {
+                        return Some(view);
+                    }
+                }
             }
             made[index as usize] = if later { 0 } else { key };
             // Not seen as made by the lock-free check until it is.
@@ -3021,6 +3033,113 @@ fn keep_views() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_VIEWS").is_none_or(|v| v != "0"))
 }
 
+/// What the texture view a slot is written with has to do with the one it
+/// shows (after avatarmanz/VIctory-7900XTX, `Kin`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kin {
+    /// A texture of the same description placed elsewhere (moved, or one of
+    /// its kind).
+    Moved,
+    /// One of the same format and shape in another size: the same texture
+    /// with more or fewer levels, as a title streams it.
+    Sized,
+    /// A view of the same dimension, of another texture.
+    Other,
+    /// A view no shader that reads the one can read.
+    None,
+}
+
+impl Kin {
+    /// Whether the slot goes on showing what it shows, by [`keep_shown`].
+    fn kept(self, keep: u8) -> bool {
+        match self {
+            Kin::Moved | Kin::Sized => keep >= 1,
+            Kin::Other => keep >= 2,
+            Kin::None => false,
+        }
+    }
+
+    fn number(self) -> usize {
+        match self {
+            Kin::Moved => 0,
+            Kin::Sized => 1,
+            Kin::Other => 2,
+            Kin::None => 3,
+        }
+    }
+}
+
+/// [`Kin`] of the view `old`, which a slot shows, and `new`, another
+/// texture's (the same placed texture is [`same_placed_texture`]).
+fn kin(old: &View, new: &View) -> Kin {
+    if let (View::Placed(false, a, from), View::Placed(false, b, to)) = (old, new) {
+        if a[0] == 1 || b[0] == 1 || from[1] != to[1] {
+            return Kin::None;
+        }
+        // (Width, 64 bits, height, depth and levels, format: words 4 to 8.)
+        if a[0] == b[0] && a[2..13] == b[2..13] {
+            return Kin::Moved;
+        }
+        let (wide, high) = ([a[4], b[4]].map(u64::from), [a[6], b[6]].map(u64::from));
+        return if from[0] == to[0] && a[0] == b[0] && wide[0] * high[1] == wide[1] * high[0] {
+            Kin::Sized
+        } else {
+            Kin::Other
+        };
+    }
+    let dimension = |view: &View| match view {
+        View::Placed(false, resource, desc) if resource[0] != 1 => desc[1],
+        View::Shader(r, Some(desc)) if crate::resource::buffer_bytes(*r as crate::object::This).is_none() => desc[1],
+        _ => 0,
+    };
+    match (dimension(old), dimension(new)) {
+        (0, _) | (_, 0) => Kin::None,
+        (a, b) if a == b => Kin::Other,
+        _ => Kin::None,
+    }
+}
+
+/// Whether a slot that is written with a view of another texture, one that
+/// has to wait for its host copy, goes on showing the texture it shows until
+/// the new one is made and uploaded (`VICTORY_KEEP_SHOWN`; unset or 0: no,
+/// it is made null at once and reads as zeros, as before; 1: when the new
+/// one is of the same kind in another place or size; 2: any of the same
+/// dimension). After avatarmanz/VIctory-7900XTX (`VICTORY_KEEP_SHOWN`, 1 by
+/// default there): "black, then grey for a frame or two is what popped".
+/// Here the whole screen of the title's loading art went black for two or
+/// three frames at a time (run flickB: the presented image itself black,
+/// one draw that frame, 66 textures picked by index waiting for their
+/// memory).
+fn keep_shown() -> u8 {
+    static KEEP: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *KEEP.get_or_init(|| std::env::var("VICTORY_KEEP_SHOWN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0).min(2))
+}
+
+/// With [`keep_shown`]: slots that showed a texture and were written with a
+/// view of another that waits, since the start, by [`Kin`] (moved, sized,
+/// other, none), and those of them that kept what they showed.
+static REWRITTEN: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Counts a slot [`REWRITTEN`] and logs the counts at powers of two.
+fn rewritten(kin: Kin, kept: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    REWRITTEN[kin.number()].fetch_add(1, Relaxed);
+    REWRITTEN[4].fetch_add(u64::from(kept), Relaxed);
+    let n: u64 = REWRITTEN[..4].iter().map(|n| n.load(Relaxed)).sum();
+    if n.is_power_of_two() {
+        tracing::info!(
+            "slots written with another texture that waits, since the start (VICTORY_KEEP_SHOWN={}): {} moved, {} sized, {} other, \
+             {} none; {} kept what they showed",
+            keep_shown(),
+            REWRITTEN[0].load(Relaxed),
+            REWRITTEN[1].load(Relaxed),
+            REWRITTEN[2].load(Relaxed),
+            REWRITTEN[3].load(Relaxed),
+            REWRITTEN[4].load(Relaxed)
+        );
+    }
+}
+
 /// Whether both are shader views of one texture the title placed in
 /// memory: the same address and the same resource description, whatever
 /// part of it each shows.
@@ -3219,6 +3338,42 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// VICTORY_KEEP_SHOWN: a placed texture of the same description is
+    /// "moved", the same texture streamed at another size "sized", another
+    /// shape "other", another dimension "none"; 1 keeps moved and sized,
+    /// 2 also other.
+    #[test]
+    fn kinds_of_rewritten_texture_views() {
+        use super::{Kin, View, kin};
+        let texture = |width: u32, height: u32, levels: u32| {
+            let mut r = [0u32; 14];
+            r[0] = 3; // a 2D texture, not a buffer (1)
+            r[4] = width;
+            r[6] = height;
+            r[7] = levels;
+            r[8] = 71; // a format
+            r
+        };
+        let view = |r: [u32; 14], dimension: u32, at: u32| {
+            let mut d = [0u32; 16];
+            d[0] = 71;
+            d[1] = dimension;
+            d[10] = at;
+            View::Placed(false, r, d)
+        };
+        let old = view(texture(1024, 512, 11), 4, 0x100);
+        assert_eq!(kin(&old, &view(texture(1024, 512, 11), 4, 0x900)), Kin::Moved);
+        assert_eq!(kin(&old, &view(texture(256, 128, 9), 4, 0x900)), Kin::Sized);
+        assert_eq!(kin(&old, &view(texture(256, 256, 9), 4, 0x900)), Kin::Other);
+        assert_eq!(kin(&old, &view(texture(1024, 512, 11), 7, 0x900)), Kin::None, "another dimension");
+        let mut buffer = texture(1024, 512, 11);
+        buffer[0] = 1;
+        assert_eq!(kin(&old, &view(buffer, 4, 0x900)), Kin::None, "a buffer");
+        assert!(Kin::Moved.kept(1) && Kin::Sized.kept(1) && !Kin::Other.kept(1) && !Kin::None.kept(1));
+        assert!(Kin::Other.kept(2) && !Kin::None.kept(2));
+        assert!(!Kin::Moved.kept(0), "off keeps nothing");
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
