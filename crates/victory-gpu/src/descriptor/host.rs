@@ -1944,6 +1944,18 @@ impl HostHeap {
                 due.push((index as u32, handle));
             }
         }
+        // One lock for the page's records (`mirror_page_lock`): with the
+        // recording threads' looks lock-free, holding it a page at a time
+        // keeps few of them waiting.
+        if mirror_page_lock() && !due.is_empty() {
+            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            for &(index, handle) in &due {
+                if index < self.count {
+                    self.mirror_locked(&mut made, index, handle, false);
+                }
+            }
+            return (looked, due.len() as u64);
+        }
         for &(index, handle) in &due {
             self.mirror(index, handle, false);
         }
@@ -1985,6 +1997,15 @@ impl HostHeap {
             return Some(view);
         }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        self.mirror_locked(&mut made, index, handle, for_draw)
+    }
+
+    /// [`HostHeap::mirror`] past its lock-free look, with `made`'s lock held
+    /// by the caller (`index` inside the heap).
+    fn mirror_locked(&self, made: &mut Vec<u64>, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        // SAFETY: the handle is a descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let key = u64::from(generation) << 32 | u64::from(i);
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
@@ -2006,7 +2027,7 @@ impl HostHeap {
             // let go of the host copies they held.
             for stale in self.note_buffer(index, Some(&view), for_draw) {
                 if stale != index {
-                    self.unmake(&mut made, stale);
+                    self.unmake(made, stale);
                 }
             }
             // A view of a texture object that has no host copy yet waits
@@ -2280,6 +2301,18 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
 
 /// The host resource a slot made by [`make`] views, if any.
 type Kept = Option<ID3D12Resource>;
+
+/// Whether the pass over records copied in as bytes makes a changed page's
+/// records under one hold of `made`'s lock (`VICTORY_MIRROR_PAGE_LOCK=1`;
+/// off by default) rather than one per record. Run batch28: the submitting
+/// thread waited 2.7 ms a frame for that lock in `sync_heaps`, taking it some
+/// 13,000 times a frame; with `VICTORY_MIRROR_FAST` the recording threads
+/// seldom take it. The lock order is the same (`made`, then what a record's
+/// making takes).
+fn mirror_page_lock() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MIRROR_PAGE_LOCK").is_some_and(|v| v == "1"))
+}
 
 /// Whether [`HostHeap::mirror`] answers a slot that is as it was without
 /// taking `made`'s lock (`VICTORY_MIRROR_FAST=1`; off by default).
