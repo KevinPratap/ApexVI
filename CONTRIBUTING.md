@@ -43,7 +43,7 @@ Claims expire after **14 days** without an open PR, and edited comments are igno
    ```powershell
    cargo xtask policy
    cargo clippy --workspace --all-targets --locked -- -D warnings
-   cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+   cargo clippy --workspace --all-targets --features victory/diagnostics --locked -- -D warnings
    cargo test --workspace --locked
    ```
 

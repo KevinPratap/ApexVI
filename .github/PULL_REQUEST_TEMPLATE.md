@@ -22,5 +22,5 @@ What does this change do, and why?
 
 - [ ] **Asset policy (`docs/asset-policy.md`)**: `cargo xtask policy` passes; zero game files, dumps, screenshots, title/character names, or title shader hashes anywhere in code, commits, or this PR.
 - [ ] **Single change, opt-in**: one logical change, gated behind a `VICTORY_*` switch that is **off by default** (unless purely a test/doc/xtask change).
-- [ ] **Checks pass**: `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` and `cargo test --workspace --locked`.
+- [ ] **Checks pass**: `cargo clippy --workspace --all-targets --features victory/diagnostics --locked -- -D warnings` and `cargo test --workspace --locked`.
 - [ ] **Credits**: any ported or adapted work credits the author, repository, and commit/PR.

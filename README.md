@@ -42,7 +42,7 @@ Each change is opt-in behind a `VICTORY_*` switch, described where it is read;
 - **The UI plane is shown**: a Series S title presents its UI (menus, loading
   art, HUD) in a second `PresentX` plane; it is drawn over the scene in the
   present's own list (from upstream #1997 / Yaekai's #211).
-- **Textures fit a 6 GB card cleanly**: partly streamed placed textures take D3D12 Tier-2 tiles level by level (`VICTORY_LEVELS_ON_DEMAND=1`, `VICTORY_LEVELS_MIN_KB=64`) so unmapped or neighbor-packed top mips are never detiled or sampled; committed textures cap only 2K/4K mips down to 1024 (`VICTORY_TEXTURE_MIP_DROP=3`, `_CAP=1024`, `_FLOOR=256`, after upstream #2146) while keeping 1024 and smaller textures and uncompressed `Load()` masks whole.
+- **Textures fit a 6 GB card cleanly**: partly streamed placed textures take D3D12 Tier-2 tiles level by level (`VICTORY_LEVELS_ON_DEMAND=1`, `VICTORY_LEVELS_MIN_KB=64`) and keep small mips mapped up to 512 MB even when VRAM fills (`VICTORY_TILES_SMALL_WHEN_FULL_MB=512`, from `fxceless/victory-fork`) so unmapped or neighbor-packed top mips are never detiled or sampled and surfaces do not turn black under VRAM pressure; committed textures cap only 2K/4K mips down to 1024 (`VICTORY_TEXTURE_MIP_DROP=3`, `_CAP=1024`, `_FLOOR=256`, after upstream #2146) while keeping 1024 and smaller textures and uncompressed `Load()` masks whole.
 - **The card waits for less**: masked merges with an index
   (`VICTORY_MERGE_MASKED`, `_INDEX`), copies of GPU results made after their
   flight lands (`VICTORY_COPY_AFTER_LANDING`), false-positive reads let ahead
@@ -60,10 +60,8 @@ Each change is opt-in behind a `VICTORY_*` switch, described where it is read;
 - **Light**: the ambient stand-in with reflections held and the sky followed
   (`VICTORY_AMBIENT_REFLECT`, `VICTORY_AMBIENT_SKY`, from Belobug's fork).
 - **UI and loading art at full size** while world textures shrink (`VICTORY_TEXTURE_MIP_DROP_UI_FULL=2`: what a draw into a presented image samples is kept whole), **whole character torsos and wire-mesh geometry** (`VICTORY_MESH_9BIT_CORNERS=1`: 9-bit mesh primitive corner indices, dropping bit-9 edge flags so edge-flagged triangles are not culled, from upstream #1718 / `c0228d9`), **clean BC7 clothing blocks** (`VICTORY_BC7_ROTATION=1`: BC7 channel rotation restricted to modes 4 and 5, from upstream #3111), **clamped indirect mesh records and 16-bit SDWA sign-extension** (`VICTORY_INDIRECT_ZERO_GARBAGE=1`, `VICTORY_SDWA_SEXT_16=1`, from upstream #1799 / #3124 and `voidopcode/vilocity`), **full-view dirty-page and rotating-texture refreshes** (`VICTORY_PAGE_WRITES=all`, `VICTORY_TEXTURE_CHANGING=1`: every-frame rechecks for both tabled and bindless video ring-buffer textures, after `fxceless/victory-fork` #602 / #1314), **console sync UAV barriers** (`VICTORY_SYNC_BARRIER=1`, from `realblastex/flamingo`), and **zero camera jitter under spatial upscaling** (`VICTORY_SPATIAL_NO_JITTER=1`).
-- **Parallel preparation and smaller physical sections**: heap mirroring and per-copy merges on wide threads (`VICTORY_PREP_SPLIT=2`), background heap-buffer slot walk (`VICTORY_HEAP_WALK_THREAD=1`: 4.80 -> 6.60 fps with full-sharpness 1024 px textures & FSR 3.1), parallel staged-texture refresh checks (`VICTORY_PARALLEL_REFRESH=1`, from fxceless's fork), and 2 MiB physical-page sections (`VICTORY_SECTION_MB=2`, from upstream #3177: remap stalls 7.3 -> 1.3 ms/frame).
-- **Stability**: the title's hang watchdog stepped over with a log of the
-  stale heartbeat (`VICTORY_STEP_OVER`); four 64-lane programs the 32-lane host
-  refused translated with wave-wide branches (`VICTORY_WAVE_WIDE_ONLY`).
+- **Parallel preparation, background reaping, and smaller physical sections**: heap mirroring and per-copy merges on wide threads (`VICTORY_PREP_SPLIT=2`), background heap-buffer slot walk (`VICTORY_HEAP_WALK_THREAD=1`: 4.80 -> 6.60 fps with full-sharpness 1024 px textures & FSR 3.1), background D3D12 resource destruction (`VICTORY_REAPER=1`, from `fxceless/victory-fork`), parallel staged-texture refresh checks (`VICTORY_PARALLEL_REFRESH=1`, from fxceless's fork), and 2 MiB physical-page sections (`VICTORY_SECTION_MB=2`, from upstream #3177: remap stalls 7.3 -> 1.3 ms/frame).
+- **Shader accuracy and 32-lane NVIDIA lowering**: flag-only 64-lane LDS regions lowered natively as two 32-lane host waves (`VICTORY_LDS_FLAGS=1`, from `fxceless/victory-fork` after `DrTardis1963`), narrowed `rawBufferLoad` component masks (`VICTORY_NARROW_RAW_LOADS=1`), optional float fast-math bit (`VICTORY_SHADER_OPT` bit 128), and RDNA 2 fused `v_mad_legacy_f32` with subnormal flush (`VICTORY_LEGACY_FMAD=1`, after upstream #1026); the title's hang watchdog stepped over (`VICTORY_STEP_OVER`) and three remaining 64-lane programs translated with wave-wide branches (`VICTORY_WAVE_WIDE_ONLY`).
 
 What was tried and measured as no gain or a loss is recorded in the commit
 messages (in-place GPU reads over PCIe, local fill-ahead, wide refresh with the
@@ -121,7 +119,7 @@ A tree of other people's work; ported commits name their source.
 - **[fablinoo/kelvaroq](https://github.com/fablinoo/kelvaroq)**: write watch per reservation, frames ahead.
 - **[realblastex/flamingo](https://github.com/realblastex/flamingo)**: the fast path settings and console pipeline sync barrier.
 - **[voidopcode/vilocity](https://github.com/voidopcode/vilocity)**: remaining list budget preserved when clamping oversized indirect mesh records.
-- Upstream pull requests #1718, #1799, #1997 (Yaekai, Calvix2k), #2146, #3111 (RVZO6), #3124, #3177 (KainanP, RyanCase94, CuteBooty).
+- Upstream pull requests #1026, #1718, #1799, #1997 (Yaekai, Calvix2k), #2146, #3111 (RVZO6), #3124, #3177 (KainanP, RyanCase94, CuteBooty), and DrTardis1963 (`1b5c3a1e`).
 - Changes in this fork were made with [Claude Code](https://claude.com/claude-code).
 
 ## License
