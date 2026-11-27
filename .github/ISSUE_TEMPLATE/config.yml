@@ -1,11 +1,11 @@
 blank_issues_enabled: false
 contact_links:
   - name: Claim a task (Coordination Issue #1)
-    url: https://github.com/KevinPratap/ApexIV/issues/1
+    url: https://github.com/KevinPratap/ApexVI/issues/1
     about: Claim open work (`claiming: <ID>`) or post a technical finding (`finding: <one line>`) so contributors don't duplicate effort.
   - name: Live Claims & Forge Status
-    url: https://github.com/KevinPratap/ApexIV/tree/forge/status
+    url: https://github.com/KevinPratap/ApexVI/tree/forge/status
     about: Check CLAIMS.md (who holds each task) and STATUS.md (which open PRs build together on forge/main).
   - name: Asset Policy (Rule #1 — Read Before Posting)
-    url: https://github.com/KevinPratap/ApexIV/blob/main/docs/asset-policy.md
+    url: https://github.com/KevinPratap/ApexVI/blob/main/docs/asset-policy.md
     about: Never post game files, dumps, screenshots, executable names, character names, or title shader hashes.

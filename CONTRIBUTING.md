@@ -1,6 +1,6 @@
-# Contributing to ApexIV
+# Contributing to ApexVI
 
-ApexIV is tuned for **laptops and graphics cards with 6-8 GB VRAM**, where every megabyte of video memory and millisecond of CPU preparation counts. Humans and coding agents coordinate here under the same transparent rules used in VIctory.
+ApexVI is tuned for **laptops and graphics cards with 6-8 GB VRAM**, where every megabyte of video memory and millisecond of CPU preparation counts. Humans and coding agents coordinate here under the same transparent rules used in VIctory.
 
 ## 1. Rule #1: Asset policy (non-negotiable)
 
@@ -15,7 +15,7 @@ cargo xtask install-hooks
 
 ## 2. Claim before you write code
 
-So two contributors (or two agents) do not write the same fix twice, check **[CLAIMS.md](https://github.com/KevinPratap/ApexIV/blob/forge/status/CLAIMS.md)** and open pull requests first, then comment in **[Issue #1 — Coordinating who works on what](https://github.com/KevinPratap/ApexIV/issues/1)**:
+So two contributors (or two agents) do not write the same fix twice, check **[CLAIMS.md](https://github.com/KevinPratap/ApexVI/blob/forge/status/CLAIMS.md)** and open pull requests first, then comment in **[Issue #1 — Coordinating who works on what](https://github.com/KevinPratap/ApexVI/issues/1)**:
 
 - `claiming: <ID>` — take an open task from Issue #1 or `CLAIMS.md` before starting.
 - `claiming: <one line>` — claim a task not yet listed (assigns `NEW-n`).
@@ -49,4 +49,4 @@ Claims expire after **14 days** without an open PR, and edited comments are igno
 
 ## 4. The Forge (`forge/main`)
 
-Every 12 hours, `.github/workflows/forge.yml` runs `cargo xtask forge` to build **`forge/main`** — `main` plus every open non-draft pull request that merges cleanly, compiles, passes `cargo xtask policy`, and does not touch `.github/workflows/`. Per-PR merge and test results are published to **[STATUS.md](https://github.com/KevinPratap/ApexIV/blob/forge/status/STATUS.md)**. Being in `forge/main` lets testers try open PRs together; review still decides merges into `main`.
+Every 12 hours, `.github/workflows/forge.yml` runs `cargo xtask forge` to build **`forge/main`** — `main` plus every open non-draft pull request that merges cleanly, compiles, passes `cargo xtask policy`, and does not touch `.github/workflows/`. Per-PR merge and test results are published to **[STATUS.md](https://github.com/KevinPratap/ApexVI/blob/forge/status/STATUS.md)**. Being in `forge/main` lets testers try open PRs together; review still decides merges into `main`.

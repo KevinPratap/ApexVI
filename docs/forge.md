@@ -101,8 +101,8 @@ from `[[task]]` entries in `.github/forge.toml`.
 ## Running it yourself
 
 ```
-git worktree add --detach ../ApexIV-forge origin/main
-cargo xtask forge --repo ../ApexIV-forge --out <folder outside the repository> --limit 25
+git worktree add --detach ../ApexVI-forge origin/main
+cargo xtask forge --repo ../ApexVI-forge --out <folder outside the repository> --limit 25
 cargo xtask claims --out <folder outside the repository>
 ```
 

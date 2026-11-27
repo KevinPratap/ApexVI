@@ -38,7 +38,7 @@ jobs:
           shared-key: forge
       - name: Git identity for the merge commits
         run: |
-          git config --global user.name "ApexIV Forge"
+          git config --global user.name "ApexVI Forge"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
       - name: The last run's status
         run: git fetch -q origin forge/status && git show FETCH_HEAD:STATUS.md > "$RUNNER_TEMP/previous.md" || true

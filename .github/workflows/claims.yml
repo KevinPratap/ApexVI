@@ -46,6 +46,6 @@ jobs:
         run: cargo xtask claims --out "$RUNNER_TEMP/claims" --comment
       - name: Publish CLAIMS.md
         run: |
-          git config --global user.name "ApexIV Forge"
+          git config --global user.name "ApexVI Forge"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           bash .github/forge-publish.sh "Claims $(date -u +'%Y-%m-%d %H:%M UTC')" "$RUNNER_TEMP/claims/CLAIMS.md"

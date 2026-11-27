@@ -1,4 +1,4 @@
-# ApexIV
+# ApexVI
 
 A fork of [VIctory](https://github.com/Marvisak/VIctory), the compatibility
 layer that runs an Xbox Series title natively on Windows from files the user
@@ -76,8 +76,8 @@ You need Windows 10/11 x64, an AVX2 CPU, a Direct3D 12 GPU with shader model
 your own copy of the game.
 
 ```powershell
-git clone https://github.com/KevinPratap/ApexIV
-cd ApexIV
+git clone https://github.com/KevinPratap/ApexVI
+cd ApexVI
 cargo build --locked --profile diag -p victory --features diagnostics
 scripts\play.ps1 -Game <path of your own copy's executable> -Cache D:\apex-cache -Data D:\apex-data
 ```
@@ -89,8 +89,8 @@ stutters; later runs reuse the cache.
 
 Read **[CONTRIBUTING.md](CONTRIBUTING.md)** and **[docs/forge.md](docs/forge.md)** before starting:
 
-- **Coordinate in [Issue #1 — Coordinating who works on what](https://github.com/KevinPratap/ApexIV/issues/1)**: check **[CLAIMS.md](https://github.com/KevinPratap/ApexIV/blob/forge/status/CLAIMS.md)** and comment `claiming: <ID>` before writing code so two contributors (or agents) do not build the same thing twice.
-- **Combined testing branch (`forge/main`)**: every 12 hours, the Forge merges all open pull requests that fit, build, and pass `cargo xtask policy` into `forge/main` and writes **[STATUS.md](https://github.com/KevinPratap/ApexIV/blob/forge/status/STATUS.md)**.
+- **Coordinate in [Issue #1 — Coordinating who works on what](https://github.com/KevinPratap/ApexVI/issues/1)**: check **[CLAIMS.md](https://github.com/KevinPratap/ApexVI/blob/forge/status/CLAIMS.md)** and comment `claiming: <ID>` before writing code so two contributors (or agents) do not build the same thing twice.
+- **Combined testing branch (`forge/main`)**: every 12 hours, the Forge merges all open pull requests that fit, build, and pass `cargo xtask policy` into `forge/main` and writes **[STATUS.md](https://github.com/KevinPratap/ApexVI/blob/forge/status/STATUS.md)**.
 - **Measure on your machine**: `python tools/frametime.py <log> [min draws]` prints median frame parts of a run log. Report GPU (VRAM), CPU, RAM, and fps by scene.
 
 The open work, biggest first:
