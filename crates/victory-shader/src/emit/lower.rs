@@ -882,7 +882,23 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
             }
         }
     }
-    if (0..n).any(|r| reads[r] && writes[r]) {
+    // A region that reads and writes LDS is still taken when it only raises flags
+    // (`lds_flag_region`): a read that misses the other host wave's write changes nothing
+    // the region leaves behind. (After fxceless/victory-fork c005a245f and DrTardis1963
+    // 1b5c3a1e; VICTORY_LDS_FLAGS=1, off by default.)
+    let flags_on = std::env::var_os("VICTORY_LDS_FLAGS").is_some_and(|v| v == "1");
+    let has_unflagged = (0..n)
+        .filter(|&r| reads[r] && writes[r])
+        .any(|r| {
+            if !flags_on {
+                return true;
+            }
+            let blocks: Vec<usize> = (0..n)
+                .filter(|&b| !all[b] && find(&mut region, b) == r)
+                .collect();
+            !lds_flags::lds_flag_region(p, st, &blocks)
+        });
+    if has_unflagged {
         return None;
     }
     let mut meet = vec![(false, false); n];
@@ -899,6 +915,9 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
     }
     Some(meet)
 }
+
+#[path = "lds_flags.rs"]
+mod lds_flags;
 
 /// Masks held as numbers or constant lane sets in guards or lane branches: the lane tests its
 /// own bit by its console lane.
@@ -949,6 +968,50 @@ thread_local! {
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test override for [`legacy_fmad_enabled`].
+    #[cfg(test)]
+    static FORCE_LEGACY_FMAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn legacy_fmad_enabled() -> bool {
+    #[cfg(test)]
+    if FORCE_LEGACY_FMAD.get() {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LEGACY_FMAD").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+pub(super) fn with_legacy_fmad<R>(f: impl FnOnce() -> R) -> R {
+    let was = FORCE_LEGACY_FMAD.replace(true);
+    let r = f();
+    FORCE_LEGACY_FMAD.set(was);
+    r
+}
+
+fn emit_legacy_fmad(l: &mut Lower<'_>, a: V, b: V, add: V) -> V {
+    fn ftz(l: &mut Lower<'_>, x: V) -> V {
+        let c = l.cur;
+        let bits = l.as_int(x);
+        let exp_mask = l.s.m.i32(0x7F80_0000);
+        let sign_mask = l.s.m.i32(0x8000_0000);
+        let zero = l.s.m.i32(0);
+        let exp = l.s.m.bin(c, Bin::And, bits, exp_mask);
+        let sub = l.s.m.cmp(c, pred::EQ, exp, zero);
+        let signed_zero = l.s.m.bin(c, Bin::And, bits, sign_mask);
+        let flushed = l.s.m.select(c, sub, signed_zero, bits);
+        l.as_float(flushed)
+    }
+    let (a, b, add) = (ftz(l, a), ftz(l, b), ftz(l, add));
+    let cur = l.cur;
+    let fused = l.fmad(a, b, add);
+    let zero = l.s.m.f32(0);
+    let az = l.s.m.cmp(cur, pred::OEQ, a, zero);
+    let bz = l.s.m.cmp(cur, pred::OEQ, b, zero);
+    let z = l.s.m.bin(cur, Bin::Or, az, bz);
+    let addend = l.s.m.bin(cur, Bin::Add, zero, add);
+    l.s.m.select(cur, z, addend, fused)
 }
 
 /// As [`with_local_waves`], with every other use of a lane mask as a number
@@ -7169,6 +7232,7 @@ impl<'a> Lower<'a> {
                         let m = self.s.m.bin(c, Bin::Mul, a, bb);
                         self.s.m.bin(c, Bin::Add, m, acc)
                     }
+                    _ if legacy_fmad_enabled() => emit_legacy_fmad(self, a, bb, acc),
                     _ => {
                         let m = self.legacy_mul(a, bb);
                         self.s.m.bin(c, Bin::Add, m, acc)
@@ -7176,14 +7240,20 @@ impl<'a> Lower<'a> {
                 };
                 float(self, r)
             }
-            "v_mad_f32" | "v_madak_f32" | "v_madmk_f32" | "v_mad_legacy_f32" => {
+            "v_mad_f32" | "v_madak_f32" | "v_madmk_f32" => {
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
-                let m = if name == "v_mad_legacy_f32" {
-                    self.legacy_mul(a, bb)
-                } else {
-                    self.s.m.bin(c, Bin::Mul, a, bb)
-                };
+                let m = self.s.m.bin(c, Bin::Mul, a, bb);
                 let r = self.s.m.bin(c, Bin::Add, m, cc);
+                float(self, r)
+            }
+            "v_mad_legacy_f32" => {
+                let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
+                let r = if legacy_fmad_enabled() {
+                    emit_legacy_fmad(self, a, bb, cc)
+                } else {
+                    let m = self.legacy_mul(a, bb);
+                    self.s.m.bin(c, Bin::Add, m, cc)
+                };
                 float(self, r)
             }
             "v_max3_f32" | "v_min3_f32" | "v_med3_f32" => {
