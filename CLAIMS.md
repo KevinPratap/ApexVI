@@ -1,0 +1,14 @@
+# Claims
+
+Who works on what, from the comments in #1. Rules: [docs/forge.md](https://github.com/KevinPratap/ApexVI/blob/main/docs/forge.md#claims). **Before you write code**, comment `claiming: <ID>` there (or `claiming: <one line>` for something new); when your pull request is open, `done: <ID> -> #<PR>` (or put the ID in the pull request); `finding: <one line>` adds a task.
+
+| ID | Status | What | Where | Needs | Holder / pull request |
+|---|---|---|---|---|---|
+| `GPU-CARD-HASH-WIDE` | open | Compute copy-piece card hashes with a 64-thread group per piece instead of one thread per piece, trimming GPU hash/compare cost per frame. | crates/victory-gpu/src/host.rs (`CARD_COMPARE_WIDE`, `card_hash_wide`) | D3D12 GPU (synthetic test + optional title run) |  |
+| `GPU-PIPELINE-LIBRARY-SPLIT` | open | Split the serialized host pipeline library by stage or shard so incremental saves do not rewrite a single multi-hundred-MB blob. | crates/victory-gpu/src/pipeline/library.rs | none |  |
+| `GPU-PREP-SPLIT-B` | open | Overlap preparation of submission N+1 with submission N's D3D12 execution (Design B in `docs/prep-split-plan.md`), cutting the 40-50 ms card idle gap on 6 GB laptops. | crates/victory-gpu/src/host.rs (`submit`, `run_deferred`, `merge_under_writes`), docs/prep-split-plan.md | the game for frame-time measurement |  |
+| `GPU-RT-BVH` | open | Build host DXR acceleration structures or stand-in traversal for the ray-tracing structure builder draws (~400 draws/frame currently skipped) so unlit interiors receive indirect bounce. | crates/victory-gpu/src/pipeline, crates/victory-shader/src/emit/intersect.rs, docs/fork-ray-tracing.md | DXR 1.1 GPU |  |
+| `GPU-SNAPSHOT-DIFF` | open | Replace per-submission CPU snapshot copies of writable GPU ranges with GPU-side page diffing so only pages actually modified by shaders copy back. | crates/victory-gpu/src/shadow.rs (`writing`, `copy_back`), copystat diagnostics | D3D12 GPU; the game for end-to-end measurement |  |
+| `GPU-VRAM-6GB-EVICT` | open | Evict cold D3D12 Tier-2/3 placed texture tiles under sustained travel so 6 GB adapters stay safely under budget without dropping active close-up mips or hitching page tables. | crates/victory-gpu/src/tiles.rs, crates/victory-gpu/src/texture.rs | a 6-8 GB D3D12 GPU |  |
+| `LIGHT-TIMEOFDAY` | open | Validate and tune the sky-following and indoor ambient stand-in (`VICTORY_AMBIENT_SKY`, `VICTORY_AMBIENT_REFLECT`, `VICTORY_AMBIENT_RT`) across night, dawn, noon, and interior transitions. | crates/victory-gpu/src/ambient.rs | the game |  |
+| `SHADER-WAVE64-LDS` | open | Lower remaining 64-lane multi-wave compute shaders that read and write shared LDS across halves onto 32-lane NVIDIA hosts without subgroup corruption. | crates/victory-shader/src/emit/lower.rs (`lds_meetings`), wave64_tests.rs | 32-lane GPU (NVIDIA) for GPU tests |  |
