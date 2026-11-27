@@ -323,6 +323,8 @@ impl Tiled {
         STATS[0].fetch_add(1, Ordering::Relaxed);
         STATS[1].fetch_add(full, Ordering::Relaxed);
         STATS[4].fetch_add(1, Ordering::Relaxed);
+        BLANK[0].fetch_add(1, Ordering::Relaxed);
+        BLANK[1].fetch_add(full, Ordering::Relaxed);
         Some(Tiled {
             given: Mutex::new(Given {
                 levels: vec![false; standard.len()],
@@ -344,13 +346,11 @@ impl Tiled {
     /// from its staging buffer, of which `held` are the title's now (the
     /// others are zeros there): tiles for the held ones that have none.
     /// `room`: whether the card has room for more host copies
-    /// (`resource.rs` `room`). Without room no held level gets tiles: the
+    /// (`resource.rs` `room`). Without room no held level gets tiles unless
+    /// `VICTORY_TILES_SMALL_WHEN_FULL_MB` allows the smallest held levels: the
     /// list still brings the levels that have theirs up to date (which
     /// takes none of the card's memory), and its copies into the others go
-    /// nowhere. (An upload of a host copy that exists passes the full
-    /// card's gate in `draw.rs` on the ground that it takes no memory;
-    /// with tiles given here regardless, the line would not bound these
-    /// textures.)
+    /// nowhere.
     /// Returns whether the first level a view may show changed, and
     /// whether a level named is still without tiles (no room, or no heap
     /// could be had): the caller has the upload recorded again later, or
@@ -376,9 +376,21 @@ impl Tiled {
         self.held.store(held, Ordering::Relaxed);
         let card = self.card.load(Ordering::Relaxed);
         let named = held | card;
-        // The levels the card itself writes are few and are not kept
-        // waiting: a write of the card's into no memory is lost.
-        let changed = self.give_locked(&mut given, queue, device, texture, named, if room { named } else { card });
+        // On a full card, with `VICTORY_TILES_SMALL_WHEN_FULL_MB`, the smallest
+        // held levels still get tiles so textures show small mips instead of black
+        // (after `fxceless/victory-fork` f6a09d3ba4 / 0a40a00a6; default 0 = off).
+        let small = if room { 0 } else { self.small_levels(held) };
+        if small != 0 {
+            BLANK[2].fetch_add(u64::from(small.count_ones()), Ordering::Relaxed);
+        }
+        let changed = self.give_locked(
+            &mut given,
+            queue,
+            device,
+            texture,
+            named,
+            if room { named } else { card | small },
+        );
         let missing = self.without_locked(&given, named) != 0;
         (changed, missing)
     }
@@ -428,6 +440,33 @@ impl Tiled {
             self.unclaim(without);
         }
         changed
+    }
+
+    fn small_levels(&self, held: u32) -> u32 {
+        let cap = small_when_full_mb() << 20;
+        if cap == 0 || STATS[2].load(Ordering::Relaxed) >= cap {
+            return 0;
+        }
+        let first_packed = self.standard.len() as u32;
+        let mut bits = 0u32;
+        let mut tiles = 0u32;
+        if self.packed > 0 {
+            let packed_bits = self.every_level() & !((1u32 << first_packed) - 1);
+            if held & packed_bits == 0 {
+                return 0;
+            }
+            bits |= packed_bits;
+            tiles += self.packed;
+        }
+        for level in (0..first_packed).rev() {
+            let tiles_here = self.standard[level as usize];
+            if held & (1 << level) == 0 || tiles + tiles_here > SMALL_TILES {
+                break;
+            }
+            tiles += tiles_here;
+            bits |= 1 << level;
+        }
+        if tiles > SMALL_TILES { 0 } else { bits }
     }
 
     /// The bits of the levels that get their tiles with level `level`:
@@ -587,7 +626,15 @@ impl Tiled {
             }
         };
         let shown = (0..self.levels).find(|&level| has(level) && with_tiles(level)).unwrap_or(u32::MAX);
-        self.shown.swap(shown, Ordering::Relaxed) != shown
+        let old = self.shown.swap(shown, Ordering::Relaxed);
+        if old == u32::MAX && shown != u32::MAX {
+            BLANK[0].fetch_sub(1, Ordering::Relaxed);
+            BLANK[1].fetch_sub(self.full, Ordering::Relaxed);
+        } else if old != u32::MAX && shown == u32::MAX {
+            BLANK[0].fetch_add(1, Ordering::Relaxed);
+            BLANK[1].fetch_add(self.full, Ordering::Relaxed);
+        }
+        old != shown
     }
 
     /// The first level a view of the texture may show; `None` while no
@@ -627,6 +674,21 @@ impl Tiled {
     }
 }
 
+/// Textures alive with no level shown, their full bytes, and small levels given
+/// tiles on a full card (`VICTORY_TILES_SMALL_WHEN_FULL_MB`, default 0 = off).
+pub(crate) static BLANK: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+const SMALL_TILES: u32 = 16;
+
+fn small_when_full_mb() -> u64 {
+    static MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MB.get_or_init(|| {
+        std::env::var("VICTORY_TILES_SMALL_WHEN_FULL_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(0, |mb| mb.min(1024))
+    })
+}
+
 impl Drop for Tiled {
     fn drop(&mut self) {
         let given = self.given.get_mut().unwrap_or_else(|e| e.into_inner());
@@ -642,6 +704,10 @@ impl Drop for Tiled {
         STATS[0].fetch_sub(1, Ordering::Relaxed);
         STATS[1].fetch_sub(self.full, Ordering::Relaxed);
         STATS[2].fetch_sub(bytes, Ordering::Relaxed);
+        if *self.shown.get_mut() == u32::MAX {
+            BLANK[0].fetch_sub(1, Ordering::Relaxed);
+            BLANK[1].fetch_sub(self.full, Ordering::Relaxed);
+        }
     }
 }
 
@@ -756,6 +822,16 @@ pub(crate) fn status() {
         s[7],
         s[9],
         s[10],
+    );
+    let blank: Vec<u64> = BLANK.iter().map(|b| b.load(Ordering::Relaxed)).collect();
+    tracing::info!(
+        "textures with levels on demand that show no level now: {} of {} alive ({} MB full); \
+         small levels given tiles on a full card since start (VICTORY_TILES_SMALL_WHEN_FULL_MB={}): {}",
+        blank[0],
+        s[0],
+        blank[1] >> 20,
+        small_when_full_mb(),
+        blank[2],
     );
 }
 
