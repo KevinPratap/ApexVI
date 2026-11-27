@@ -1,0 +1,39 @@
+name: Bug or regression report
+description: Report a crash, device loss, visual defect, or frame-rate regression without game assets or names
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Rule #1 ([docs/asset-policy.md](https://github.com/KevinPratap/ApexIV/blob/main/docs/asset-policy.md)):** Do **not** attach game files, dumps, shader binaries, or screenshots, and do **not** name the title, its executable, its characters, or title-specific shader hashes. Redact local file paths if needed.
+  - type: input
+    id: commit
+    attributes:
+      label: Commit & branch
+      description: Output of `git rev-parse --short HEAD` (and whether tested on `main` or `forge/main`)
+      placeholder: "e.g. d73dd5bb0 (main)"
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware & OS
+      description: GPU (with VRAM), driver version, CPU, RAM, Windows build
+      placeholder: "e.g. RTX 4050 Laptop 6 GB (572.xx), i7-12650H, 32 GB RAM, Windows 11 24H2"
+    validations:
+      required: true
+  - type: textarea
+    id: switches
+    attributes:
+      label: Switches / launch flags
+      description: Did you launch via `scripts/play.ps1`, `scripts/play.ps1 -Safe`, or custom `VICTORY_*` variables?
+    validations:
+      required: true
+  - type: textarea
+    id: happens
+    attributes:
+      label: What happens & our log lines
+      description: Describe the issue in generic terms and paste relevant VIctory/ApexIV diagnostic lines (never game strings or dumps).
+    validations:
+      required: true

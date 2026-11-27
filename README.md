@@ -85,26 +85,29 @@ scripts\play.ps1 -Game <path of your own copy's executable> -Cache D:\apex-cache
 `-Safe` leaves out the newest switches. The first run makes pipelines and
 stutters; later runs reuse the cache.
 
-## Help wanted
+## Help wanted & contributing
 
-Measure on your machine and say what you see (GPU, CPU, RAM, fps by scene).
-`tools/frametime.py <log> [min draws]` gives the median frame parts of a run
-log. The open work, biggest first:
+Read **[CONTRIBUTING.md](CONTRIBUTING.md)** and **[docs/forge.md](docs/forge.md)** before starting:
+
+- **Coordinate in [Issue #1 — Coordinating who works on what](https://github.com/KevinPratap/ApexIV/issues/1)**: check **[CLAIMS.md](https://github.com/KevinPratap/ApexIV/blob/forge/status/CLAIMS.md)** and comment `claiming: <ID>` before writing code so two contributors (or agents) do not build the same thing twice.
+- **Combined testing branch (`forge/main`)**: every 12 hours, the Forge merges all open pull requests that fit, build, and pass `cargo xtask policy` into `forge/main` and writes **[STATUS.md](https://github.com/KevinPratap/ApexIV/blob/forge/status/STATUS.md)**.
+- **Measure on your machine**: `python tools/frametime.py <log> [min draws]` prints median frame parts of a run log. Report GPU (VRAM), CPU, RAM, and fps by scene.
+
+The open work, biggest first:
 
 1. **Split the submit thread's preparation** ([docs/prep-split-plan.md](docs/prep-split-plan.md)):
    Design A: step A0 (journal lock split, `VICTORY_JOURNAL_SPLIT`, with refreshes on
-   several threads, `VICTORY_WIDE_REFRESH`) is in; heap sync and merges on the wide threads,
-   about 9 fps here) is in progress; Design B (two submissions in preparation)
-   after it, toward the card-bound ceiling of about 11-12 fps on this laptop.
-2. **Ray-traced passes**: about 400 draws a frame are the ray-tracing structure
-   builder, which does not run; rooms without direct light are dark.
-3. **Two 64-lane compute programs** still refused on 32-lane NVIDIA hosts
-   (`02384a60fda6f2d0`, `2da4beb386509b77`: multi-wave groups with LDS).
-4. **Lighting at night and noon**: the sky-following stand-in is untested
-   outside the opening's sunset.
+   several threads, `VICTORY_WIDE_REFRESH`) is in; heap sync and merges on the wide threads
+   (`VICTORY_PREP_SPLIT=2`, `VICTORY_HEAP_WALK_THREAD=1`) are in; Design B (two submissions in preparation)
+   comes next, toward the card-bound ceiling on a 6 GB laptop.
+2. **6-8 GB VRAM tile eviction and residency under long travel**: keep placed tiled resources within budget without dropping visible close-up mips or hitching on page-table updates.
+3. **Ray-traced passes**: about 400 draws a frame are the ray-tracing structure
+   builder, which does not run; rooms without direct light rely on the ambient stand-in.
+4. **Remaining 64-lane compute programs** still refused on 32-lane NVIDIA hosts
+   (multi-wave groups with LDS).
+5. **Lighting at night and noon**: test and tune the sky-following and indoor stand-ins across time of day.
 
-Pull requests: one change each, behind a switch, off by default, with what it
-was measured to do.
+Pull requests: install hooks (`cargo xtask install-hooks`), one change each, behind a `VICTORY_*` switch (off by default), with before/after measurements and source attribution. Never include game files, dumps, screenshots, or the title's name ([docs/asset-policy.md](docs/asset-policy.md)).
 
 ## Credits
 

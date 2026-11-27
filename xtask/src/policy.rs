@@ -15,6 +15,7 @@ const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
+    "py",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
@@ -49,6 +50,23 @@ const FORBIDDEN_MAGIC: &[(&[u8], &str)] = &[
 ];
 
 pub fn run(root: &Path, staged: bool) -> Result<()> {
+    let (files, violations) = violations(root, staged)?;
+    if violations.is_empty() {
+        println!("asset policy: {files} files ok");
+        return Ok(());
+    }
+    for v in &violations {
+        eprintln!("POLICY: {v}");
+    }
+    bail!(
+        "{} asset-policy violation(s). Nothing from the game may be committed; \
+         see docs/asset-policy.md",
+        violations.len()
+    )
+}
+
+/// How many files were checked, and each `path: problem` the policy finds.
+pub fn violations(root: &Path, staged: bool) -> Result<(usize, Vec<String>)> {
     let files = list_files(root, staged)?;
     let mut violations = Vec::new();
     for path in &files {
@@ -74,18 +92,7 @@ pub fn run(root: &Path, staged: bool) -> Result<()> {
             violations.push(format!("{path}: {problem}"));
         }
     }
-    if violations.is_empty() {
-        println!("asset policy: {} files ok", files.len());
-        return Ok(());
-    }
-    for v in &violations {
-        eprintln!("POLICY: {v}");
-    }
-    bail!(
-        "{} asset-policy violation(s). Nothing from the game may be committed; \
-         see docs/asset-policy.md",
-        violations.len()
-    )
+    Ok((files.len(), violations))
 }
 
 fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
@@ -194,6 +201,7 @@ mod tests {
     #[test]
     fn accepts_source() {
         assert!(check("crates/x/src/lib.rs", b"fn main() {}\n").is_empty());
+        assert!(check("tools/frametime.py", b"import sys\n").is_empty());
         assert!(check(".gitignore", b"/target/\n").is_empty());
         assert!(check(".githooks/pre-commit", b"#!/bin/sh\n").is_empty());
     }

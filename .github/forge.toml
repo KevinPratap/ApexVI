@@ -1,0 +1,23 @@
+# The Forge and claims: docs/forge.md.
+
+# The issue where work is claimed (`claiming: <ID>`, `done: <ID> -> #<PR>`,
+# `release: <ID>`, `finding: <one line>`).
+coordination_issue = 1
+
+# A claim without a pull request expires after this many days.
+claim_expiry_days = 14
+
+# Pull requests kept out of forge/main although they build: observed to break
+# the title. Each names the commit it was seen on (a prefix); a new commit lifts
+# the hold. What the build or the asset policy catches needs no hold.
+# [[hold]]
+# pr = 12
+# head = "abcdef123456"
+# reason = "In the title: what broke, on what hardware, and when."
+
+# Open work can be listed here as well as in the coordination issue's table:
+# [[task]]
+# id = "AREA-NAME"
+# what = "what needs doing"
+# where = "files"
+# needs = "game files, a GPU, or none"

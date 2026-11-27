@@ -1,0 +1,31 @@
+name: Hardware & frame-time measurement
+description: Share tools/frametime.py numbers and VRAM usage from your 6-8 GB (or desktop) machine
+title: "[Measurement]: "
+labels: ["measurement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Rule #1:** Do **not** attach screenshots or game files, and do **not** name the title, executable, or characters. Describe scenes generically (e.g. *"opening indoor room"*, *"outdoor yard"*, *"coastal road"*).
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware
+      description: GPU + VRAM, CPU, system RAM, OS
+      placeholder: "e.g. RTX 4060 Laptop 8 GB, Ryzen 7 7840HS, 32 GB RAM, Windows 11"
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: Commit & preset
+      placeholder: "e.g. d73dd5bb0 with scripts/play.ps1 default switches"
+    validations:
+      required: true
+  - type: textarea
+    id: frametime
+    attributes:
+      label: tools/frametime.py output & VRAM
+      description: Paste `python tools/frametime.py <run.log>` output, scene description, and peak VRAM from VIctory's frame summary.
+    validations:
+      required: true
