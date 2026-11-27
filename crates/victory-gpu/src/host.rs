@@ -238,6 +238,7 @@ fn prep_split_mode() -> u8 {
     })
 }
 
+#[cfg(feature = "diagnostics")]
 pub(crate) fn prep_split_configured() -> bool {
     prep_split_mode() != 0
 }
@@ -313,7 +314,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
     let started = STARTED.load(Ordering::Acquire);
     if started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
-        drop(object);
+        reap(vec![Retired(Box::new(object))]);
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
@@ -336,7 +337,95 @@ fn bury(finished: u64) {
         *retired = keep;
         done
     };
-    drop(done);
+    reap(done.into_iter().map(|(_, object)| object).collect());
+}
+
+/// Whether host objects that are let go are dropped by a dedicated thread
+/// (`VICTORY_REAPER=1`; `alt`: 20 s on/off; off by default, after
+/// `fxceless/victory-fork` f6a09d3ba4). Keeps D3D12 resource destruction off
+/// the submit and flight-landing threads.
+fn reaper_on() -> bool {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    let mode = *MODE.get_or_init(|| {
+        let asked = match std::env::var("VICTORY_REAPER").as_deref() {
+            Ok("1") => 1,
+            Ok("alt") => 2,
+            _ => 0,
+        };
+        if asked == 0
+            || std::thread::Builder::new()
+                .name("victory-reaper".into())
+                .spawn(reaper)
+                .is_err()
+        {
+            return 0;
+        }
+        tracing::info!(
+            "host objects that are let go are dropped by a thread of their own (VICTORY_REAPER=1; alt: in turn)"
+        );
+        asked
+    });
+    match mode {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on =
+                (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "host objects let go are dropped by their own thread from now (VICTORY_REAPER=alt): {}",
+                    if on { "ON" } else { "off, by the thread that lets them go as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+static REAP: (Mutex<Vec<Retired>>, std::sync::Condvar) =
+    (Mutex::new(Vec::new()), std::sync::Condvar::new());
+static REAPED: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+fn reap(objects: Vec<Retired>) {
+    if objects.is_empty() {
+        return;
+    }
+    if !reaper_on() {
+        drop(objects);
+        return;
+    }
+    REAP.0.lock().unwrap_or_else(|e| e.into_inner()).extend(objects);
+    REAP.1.notify_one();
+}
+
+fn reaper() {
+    loop {
+        let objects = {
+            let mut waiting = REAP.0.lock().unwrap_or_else(|e| e.into_inner());
+            while waiting.is_empty() {
+                waiting = REAP.1.wait(waiting).unwrap_or_else(|e| e.into_inner());
+            }
+            std::mem::take(&mut *waiting)
+        };
+        let began = std::time::Instant::now();
+        let count = objects.len() as u64;
+        drop(objects);
+        let us = began.elapsed().as_micros() as u64;
+        let before = REAPED[0].fetch_add(count, Ordering::Relaxed);
+        let spent = REAPED[1].fetch_add(us, Ordering::Relaxed) + us;
+        if (before + count) / 4096 != before / 4096 {
+            tracing::info!(
+                "host objects dropped by their own thread (VICTORY_REAPER): {} so far in {:.1} ms ({:.0} us each); last batch {count} in {:.1} ms",
+                before + count,
+                spent as f64 / 1e3,
+                spent as f64 / (before + count) as f64,
+                us as f64 / 1e3
+            );
+        }
+    }
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
@@ -3177,17 +3266,17 @@ mod fill_ahead {
                 continue;
             }
             if local() {
-                if let Some(pieces) = mark_hot(from, to) {
-                    if pieces <= 64 {
-                        tracing::warn!(
-                            "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders \
-                             changed them (first at {:#x}, landed in frame {frame}): the lists of that submission drew with the \
-                             bytes from before. Fills and copies that read its 64 KiB wait for flights from here on, the others \
-                             not (VICTORY_FILL_AHEAD_LOCAL=1; {pieces} pieces wait, {n} such fills)",
-                            to - from,
-                            a + first
-                        );
-                    }
+                if let Some(pieces) = mark_hot(from, to)
+                    && pieces <= 64
+                {
+                    tracing::warn!(
+                        "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders \
+                         changed them (first at {:#x}, landed in frame {frame}): the lists of that submission drew with the \
+                         bytes from before. Fills and copies that read its 64 KiB wait for flights from here on, the others \
+                         not (VICTORY_FILL_AHEAD_LOCAL=1; {pieces} pieces wait, {n} such fills)",
+                        to - from,
+                        a + first
+                    );
                 }
                 continue;
             }

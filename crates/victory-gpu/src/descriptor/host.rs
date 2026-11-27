@@ -2072,7 +2072,7 @@ impl HostHeap {
 
     /// [`HostHeap::mirror`] past its lock-free look, with `made`'s lock held
     /// by the caller (`index` inside the heap).
-    fn mirror_locked(&self, made: &mut Vec<u64>, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+    fn mirror_locked(&self, made: &mut [u64], index: u32, handle: u64, for_draw: bool) -> Option<View> {
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         let key = u64::from(generation) << 32 | u64::from(i);
